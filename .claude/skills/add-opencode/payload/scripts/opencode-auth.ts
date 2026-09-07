@@ -12,15 +12,15 @@ import { removeEnvVar, upsertEnvVar } from '../setup/set-env.js';
 import { pathToFileURL } from 'url';
 import { buildOneCliManagedStub, isOneCliManagedStub } from '../src/providers/opencode-auth-stub.js';
 export { buildOneCliManagedStub } from '../src/providers/opencode-auth-stub.js';
-import { CONTAINER_IMAGE, ONECLI_URL, ONECLI_API_KEY } from '../src/config.js';
+import { CONTAINER_IMAGE } from '../src/config.js';
 import { CONTAINER_RUNTIME_BIN } from '../src/container-runtime.js';
-import { chooseOpenCodeModel, discoverRuntimeModels } from './opencode-model-config.js';
+import { chooseOpenCodeModel, discoverRuntimeModels, discoverLocalModelIds } from './opencode-model-config.js';
+export { discoverLocalModelIds } from './opencode-model-config.js';
+import { apiKeyInjection, CHATGPT_SECRET, createOpenCodeVault, findOpenCodeSecret } from './opencode-vault.js';
 
 type Backend = 'chatgpt' | 'local' | 'openrouter' | 'deepseek' | 'custom' | 'skip';
 type ChatGptLoginMethod = 'browser' | 'device';
 
-const MAX_MODEL_DISCOVERY_BYTES = 1024 * 1024;
-const OPENCODE_AUTH_MODE = 'OPENCODE_AUTH_MODE';
 const OPENCODE_CHATGPT_STUB = path.join('data', 'opencode', 'openai-auth-stub.json');
 
 function answer<T>(value: T | symbol): T {
@@ -34,90 +34,23 @@ function answer<T>(value: T | symbol): T {
 function validHttpUrl(value: string): string | undefined {
   try {
     const url = new URL(value);
-    if (url.protocol === 'http:' || url.protocol === 'https:') return undefined;
+    if (
+      (url.protocol === 'http:' || url.protocol === 'https:') &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+    )
+      return undefined;
   } catch {
     // handled below
   }
-  return 'Enter an absolute http(s) URL.';
+  return 'Enter an absolute http(s) URL without embedded credentials, query, or fragment.';
 }
 
 /** Clack returns undefined when an optional password prompt is submitted blank. */
 export function normalizeOptionalInput(value: string | undefined): string {
   return value?.trim() ?? '';
-}
-
-/** Probe a container-facing OpenAI-compatible URL from the host setup process. */
-export async function discoverLocalModelIds(
-  baseUrl: string,
-  fetchImpl: typeof fetch = globalThis.fetch,
-): Promise<string[]> {
-  const url = new URL(baseUrl);
-  if (url.hostname === 'host.docker.internal') url.hostname = '127.0.0.1';
-  url.pathname = `${url.pathname.replace(/\/$/, '')}/models`;
-  url.search = '';
-  url.hash = '';
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5_000);
-  try {
-    const response = await fetchImpl(url, { signal: controller.signal });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const declaredLength = Number(response.headers.get('content-length'));
-    if (Number.isFinite(declaredLength) && declaredLength > MAX_MODEL_DISCOVERY_BYTES) {
-      throw new Error('response is too large');
-    }
-    const body = await response.text();
-    if (Buffer.byteLength(body, 'utf8') > MAX_MODEL_DISCOVERY_BYTES) throw new Error('response is too large');
-    const payload = JSON.parse(body) as unknown;
-    if (!payload || typeof payload !== 'object' || !Array.isArray((payload as Record<string, unknown>).data)) {
-      throw new Error('response has no data array');
-    }
-    return [
-      ...new Set(
-        ((payload as Record<string, unknown>).data as unknown[])
-          .flatMap((entry) => {
-            if (!entry || typeof entry !== 'object') return [];
-            const id = (entry as Record<string, unknown>).id;
-            return typeof id === 'string' && id.trim() ? [id.trim()] : [];
-          })
-          .sort((a, b) => a.localeCompare(b)),
-      ),
-    ];
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-function saveKey(name: string, key: string, host: string): void {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-key-'));
-  const file = path.join(directory, 'key');
-  try {
-    fs.writeFileSync(file, key, { mode: 0o600 });
-    execFileSync(
-      'onecli',
-      [
-        'secrets',
-        'create',
-        '--name',
-        name,
-        '--type',
-        'generic',
-        '--file',
-        file,
-        '--host-pattern',
-        host,
-        '--header-name',
-        'Authorization',
-        '--value-format',
-        'Bearer {value}',
-      ],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
-    );
-  } catch {
-    throw new Error('Could not save the API key in OneCLI.');
-  } finally {
-    fs.rmSync(directory, { recursive: true, force: true });
-  }
 }
 
 function runInherit(command: string, args: string[], env: NodeJS.ProcessEnv): Promise<number> {
@@ -128,11 +61,19 @@ function runInherit(command: string, args: string[], env: NodeJS.ProcessEnv): Pr
   });
 }
 
-export function buildOpenCodeLoginArgs(loginDir: string, method: ChatGptLoginMethod, interactive: boolean): string[] {
+export function buildOpenCodeLoginArgs(
+  loginDir: string,
+  method: ChatGptLoginMethod,
+  interactive: boolean,
+  identity = { uid: process.getuid?.(), gid: process.getgid?.() },
+): string[] {
+  if (identity.uid === 0)
+    throw new Error('Run OpenCode sign-in as the non-root user that owns this NanoClaw installation.');
   const label = method === 'device' ? 'ChatGPT Pro/Plus (headless)' : 'ChatGPT Pro/Plus (browser)';
   return [
     'run',
     '--rm',
+    ...(identity.uid !== undefined ? ['--user', `${identity.uid}:${identity.gid ?? identity.uid}`] : []),
     ...(interactive ? ['-i', '-t'] : ['-i']),
     '-v',
     `${loginDir}:/opencode-login`,
@@ -143,6 +84,8 @@ export function buildOpenCodeLoginArgs(loginDir: string, method: ChatGptLoginMet
     'XDG_CONFIG_HOME=/opencode-login/config',
     '-e',
     'XDG_CACHE_HOME=/opencode-login/cache',
+    '-e',
+    'HOME=/opencode-login',
     '--entrypoint',
     'opencode',
     CONTAINER_IMAGE,
@@ -203,7 +146,13 @@ export function buildOpenCodeOAuthStub(authJson: unknown): Record<string, unknow
   const openai = (authJson as Record<string, unknown>).openai;
   if (!openai || typeof openai !== 'object') throw new Error('OpenCode auth.json has no OpenAI entry');
   const record = openai as Record<string, unknown>;
-  if (record.type !== 'oauth' || typeof record.access !== 'string' || typeof record.refresh !== 'string') {
+  if (
+    record.type !== 'oauth' ||
+    typeof record.access !== 'string' ||
+    !record.access.trim() ||
+    typeof record.refresh !== 'string' ||
+    !record.refresh.trim()
+  ) {
     throw new Error('OpenCode did not create an OpenAI OAuth credential');
   }
   return buildOneCliManagedStub();
@@ -245,26 +194,7 @@ export function buildOneCliOAuthSecret(authJson: unknown, now: Date = new Date()
 
 /** Reject unavailable/ambiguous metadata rather than creating duplicate credentials. */
 export function findChatGptSecret(payload: unknown): string | null {
-  if (!Array.isArray(payload) || payload.some((row) => !row || typeof row !== 'object')) {
-    throw new Error('OneCLI returned invalid secret metadata.');
-  }
-  const matches = payload.filter((row) => row.name === 'OpenCode ChatGPT');
-  if (matches.length > 1)
-    throw new Error('Multiple OpenCode ChatGPT credentials exist. Resolve duplicates in OneCLI before signing in.');
-  if (!matches.length) return null;
-  const secret = matches[0];
-  if (
-    typeof secret.id !== 'string' ||
-    !secret.id.trim() ||
-    secret.type !== 'openai' ||
-    secret.hostPattern !== 'chatgpt.com' ||
-    secret.valueSource !== 'inline' ||
-    secret.metadata?.authMode !== 'oauth' ||
-    secret.pathPattern
-  ) {
-    throw new Error('The OpenCode ChatGPT vault entry has unexpected metadata. Check it in OneCLI before signing in.');
-  }
-  return secret.id;
+  return findOpenCodeSecret(payload, CHATGPT_SECRET);
 }
 
 export interface ChatGptVault {
@@ -274,45 +204,15 @@ export interface ChatGptVault {
 
 /** Host-only management API; use the same gateway and key as NanoClaw's runtime. */
 export function createChatGptVault(
-  url = ONECLI_URL,
-  apiKey = ONECLI_API_KEY,
+  url?: string,
+  apiKey?: string,
   fetchImpl: typeof fetch = globalThis.fetch,
 ): ChatGptVault {
-  if (!url) throw new Error('Configure ONECLI_URL before connecting ChatGPT.');
-  const base = new URL(url);
-  if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash) {
-    throw new Error('ONECLI_URL must be an HTTP(S) gateway URL without embedded credentials, query, or fragment.');
-  }
-  const request = async (suffix: string, method: string, body?: unknown): Promise<unknown> => {
-    try {
-      const response = await fetchImpl(`${base.href.replace(/\/+$/, '')}/v1/secrets${suffix}`, {
-        method,
-        headers: {
-          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-          ...(body ? { 'Content-Type': 'application/json' } : {}),
-        },
-        ...(body ? { body: JSON.stringify(body) } : {}),
-        signal: AbortSignal.timeout(30_000),
-        redirect: 'error',
-      });
-      if (!response.ok) throw new Error();
-      return await response.json();
-    } catch {
-      // Neither the upstream response nor a transport error may echo credentials.
-      throw new Error(
-        'Could not access the ChatGPT credential in OneCLI. Check gateway connectivity and management permissions, then retry.',
-      );
-    }
-  };
+  const vault = createOpenCodeVault(CHATGPT_SECRET, url, apiKey, fetchImpl);
   return {
-    find: async () => findChatGptSecret(await request('', 'GET')),
+    find: vault.find,
     save: async (secret, existingId) => {
-      const value = JSON.stringify(secret);
-      if (existingId) {
-        await request(`/${encodeURIComponent(existingId)}`, 'PATCH', { value });
-      } else {
-        await request('', 'POST', { name: 'OpenCode ChatGPT', type: 'openai', hostPattern: 'chatgpt.com', value });
-      }
+      await vault.save(JSON.stringify(secret), existingId);
     },
   };
 }
@@ -392,7 +292,7 @@ export async function runOpenCodeAuthCli(args: string[]): Promise<void> {
   );
 }
 
-export async function runOpenCodeAuthStep(): Promise<void> {
+export async function runOpenCodeAuthStep(options: { allowSkip?: boolean } = {}): Promise<void> {
   const backend = answer(
     await brightSelect<Backend>({
       message: 'Which model backend should OpenCode use?',
@@ -410,13 +310,16 @@ export async function runOpenCodeAuthStep(): Promise<void> {
         { value: 'openrouter', label: 'OpenRouter', hint: 'API key stored in OneCLI' },
         { value: 'deepseek', label: 'DeepSeek', hint: 'API key stored in OneCLI' },
         { value: 'custom', label: 'Something else', hint: 'provider id, model, optional base URL' },
-        { value: 'skip', label: 'Skip for now', hint: 'configure OpenCode later' },
+        ...(options.allowSkip === false
+          ? []
+          : [{ value: 'skip' as const, label: 'Skip for now', hint: 'configure OpenCode later' }]),
       ],
     }),
   );
   setupLog.userInput('opencode_backend', backend);
 
   if (backend === 'skip') {
+    if (options.allowSkip === false) throw new Error('OpenCode setup requires a configured backend.');
     setupLog.step('auth', 'skipped', 0, { PROVIDER: 'opencode', REASON: 'user-skipped' });
     p.log.warn(brandBody('OpenCode configuration skipped. Re-run /add-opencode before using OpenCode groups.'));
     return;
@@ -425,34 +328,24 @@ export async function runOpenCodeAuthStep(): Promise<void> {
   let provider: string = backend;
   let baseUrl = '';
   let host = '';
+  let chatGptMethod: ChatGptLoginMethod = 'device';
   if (backend === 'chatgpt') {
     provider = 'openai';
     host = 'chatgpt.com';
-    const method = answer(
+    chatGptMethod = answer(
       await brightSelect<ChatGptLoginMethod>({
         message: 'How would you like to connect ChatGPT?',
         options: [
           { value: 'device', label: 'Device pairing', hint: 'recommended over SSH — shows a URL and code' },
-          { value: 'browser', label: 'Browser sign-in', hint: 'opens a browser on this machine' },
+          {
+            value: 'browser',
+            label: 'Browser sign-in',
+            hint: 'open the displayed URL; requires a local browser callback',
+          },
         ],
       }),
     );
-    setupLog.userInput('opencode_chatgpt_auth_method', method);
-    try {
-      await runOpenCodeChatGptAuth(method);
-    } catch (error) {
-      setupLog.step('auth', 'failed', 0, {
-        PROVIDER: 'opencode',
-        BACKEND: backend,
-        ERROR: error instanceof Error ? error.message : String(error),
-      });
-      p.log.error(
-        brandBody(
-          `Could not connect ChatGPT (${error instanceof Error ? error.message : String(error)}). Re-run setup and try again.`,
-        ),
-      );
-      process.exit(1);
-    }
+    setupLog.userInput('opencode_chatgpt_auth_method', chatGptMethod);
   } else if (backend === 'local') {
     provider = 'openai';
     baseUrl = answer(
@@ -474,7 +367,8 @@ export async function runOpenCodeAuthStep(): Promise<void> {
       await p.text({
         message: 'OpenCode provider id',
         placeholder: 'google',
-        validate: (v) => (String(v ?? '').trim() ? undefined : 'Required.'),
+        validate: (v) =>
+          /^[a-z0-9][a-z0-9_-]*$/i.test(String(v ?? '').trim()) ? undefined : 'Use a valid OpenCode provider id.',
       }),
     )
       .trim()
@@ -486,13 +380,25 @@ export async function runOpenCodeAuthStep(): Promise<void> {
         validate: (value) => (String(value ?? '').trim() ? validHttpUrl(String(value).trim()) : undefined),
       }),
     ).trim();
-    host = baseUrl ? new URL(baseUrl).hostname : '';
+    host = baseUrl
+      ? new URL(baseUrl).hostname
+      : ((
+          {
+            google: 'generativelanguage.googleapis.com',
+            anthropic: 'api.anthropic.com',
+            openai: 'api.openai.com',
+            openrouter: 'openrouter.ai',
+            deepseek: 'api.deepseek.com',
+          } as Record<string, string>
+        )[provider] ?? '');
   }
+
+  if (!/^[a-z0-9][a-z0-9_-]*$/.test(provider)) throw new Error('Invalid OpenCode provider id.');
 
   let discoveredModels: string[] = [];
   try {
     discoveredModels =
-      backend === 'local'
+      provider === 'openai' && baseUrl
         ? (await discoverLocalModelIds(baseUrl)).map((id) => `${provider}/${id}`)
         : discoverRuntimeModels(provider, true, backend === 'chatgpt');
   } catch {
@@ -500,21 +406,25 @@ export async function runOpenCodeAuthStep(): Promise<void> {
   }
   const model = await chooseOpenCodeModel(provider, discoveredModels);
 
-  const key =
-    backend === 'chatgpt'
-      ? ''
-      : normalizeOptionalInput(
-          answer(
-            await p.password({
-              message: backend === 'local' ? 'API key (leave blank if this endpoint is keyless)' : 'API key',
-              validate: (value) =>
-                (backend !== 'openrouter' && backend !== 'deepseek') || String(value ?? '').trim()
-                  ? undefined
-                  : 'Required.',
-            }),
-          ),
-        );
-  if (key) {
+  const defaults: Record<string, string | undefined> = {
+    OPENCODE_PROVIDER: provider,
+    OPENCODE_MODEL: model,
+    OPENCODE_SMALL_MODEL: model,
+    OPENCODE_BASE_URL: baseUrl || 'native',
+    OPENCODE_AUTH_MODE: backend === 'chatgpt' ? 'chatgpt' : undefined,
+  };
+  for (const [name, value] of Object.entries(defaults)) {
+    if (process.env[name] !== undefined && process.env[name] !== (value ?? '')) {
+      throw new Error(
+        `An exported ${name} overrides this selection. Unset it before changing the saved configuration.`,
+      );
+    }
+  }
+
+  if (backend === 'chatgpt') {
+    await runOpenCodeChatGptAuth(chatGptMethod);
+  } else {
+    const injectionConfig = apiKeyInjection(provider);
     if (!host) {
       host = answer(
         await p.text({
@@ -524,27 +434,77 @@ export async function runOpenCodeAuthStep(): Promise<void> {
         }),
       ).trim();
     }
-    saveKey(`OpenCode ${provider}`, key, host);
+    // A keyless local endpoint needs no vault connection. Offer that choice
+    // before lookup; all credentialed paths validate metadata before asking for a key.
+    const keyless =
+      provider === 'openai' &&
+      Boolean(baseUrl) &&
+      answer(
+        await p.confirm({
+          message: 'Does this endpoint work without an API key?',
+          initialValue: true,
+        }),
+      );
+    if (!keyless) {
+      const vault = createOpenCodeVault({
+        name: `OpenCode ${provider}`,
+        type: 'generic',
+        hostPattern: host,
+        injectionConfig,
+      });
+      const existingId = await vault.find();
+      const key = normalizeOptionalInput(
+        answer(
+          await p.password({
+            message: existingId ? 'API key (leave blank to keep the existing credential)' : 'API key',
+            validate: (value) => (existingId || String(value ?? '').trim() ? undefined : 'Required.'),
+          }),
+        ),
+      );
+      if (key) {
+        const id = await vault.save(key, existingId);
+        p.log.info(
+          brandBody(
+            `OneCLI credential ${id} ${existingId ? 'updated; existing grants preserved' : 'created; grant it to selective agents before use'}.`,
+          ),
+        );
+      } else if (!existingId) {
+        throw new Error('An API key is required for this backend.');
+      } else {
+        await vault.keep(existingId);
+      }
+    }
   }
 
   // Commit defaults only after prompts and vaulting succeed. Preserve other
   // providers' endpoint settings, including the old shared variable.
-  upsertEnvVar('OPENCODE_PROVIDER', provider);
-  upsertEnvVar('OPENCODE_MODEL', model);
-  upsertEnvVar('OPENCODE_SMALL_MODEL', model);
-  upsertEnvVar('OPENCODE_BASE_URL', baseUrl || 'native');
-  if (backend === 'chatgpt') upsertEnvVar(OPENCODE_AUTH_MODE, 'chatgpt');
-  else removeEnvVar(OPENCODE_AUTH_MODE);
+  for (const [name, value] of Object.entries(defaults)) {
+    if (value === undefined) removeEnvVar(name);
+    else upsertEnvVar(name, value);
+  }
 
   setupLog.step('auth', 'success', 0, { PROVIDER: 'opencode', BACKEND: backend });
   p.log.success(brandBody('OpenCode configured. Credentials, when supplied, live in OneCLI.'));
 }
 
+/** Setup treats a normal return as success and may select this provider as the default. */
+export async function runOpenCodeSetupAuth(): Promise<void> {
+  await runOpenCodeAuthStep({ allowSkip: false });
+}
+
 export async function checkOpenCodeInstall(): Promise<void> {
   const required = [
     'src/providers/opencode.ts',
+    'src/provider-contracts/opencode.ts',
+    'setup/providers/opencode.ts',
+    'container/agent-runner/src/provider-contracts/opencode.ts',
     'container/agent-runner/src/providers/opencode.ts',
+    'container/agent-runner/src/providers/opencode-config.ts',
+    'container/agent-runner/src/providers/opencode-turn.ts',
+    'container/agent-runner/src/providers/opencode-memory.ts',
+    'container/agent-runner/src/providers/opencode-memory-plugin.ts',
     'container/agent-runner/src/providers/mcp-to-opencode.ts',
+    'scripts/opencode-vault.ts',
   ];
   for (const file of required) {
     if (!fs.existsSync(path.join(process.cwd(), file))) throw new Error(`OpenCode payload is missing ${file}`);
@@ -563,6 +523,32 @@ export async function checkOpenCodeInstall(): Promise<void> {
   }
   if (cli?.version !== '1.18.25' || cli.onlyBuilt !== true) {
     throw new Error('OpenCode CLI must be pinned to 1.18.25 with trusted postinstall enabled');
+  }
+  for (const barrel of [
+    'src/providers/index.ts',
+    'src/provider-contracts/index.ts',
+    'setup/providers/index.ts',
+    'container/agent-runner/src/providers/index.ts',
+    'container/agent-runner/src/provider-contracts/index.ts',
+  ]) {
+    if (!/^\s*import ['"]\.\/opencode\.js['"];?\s*$/m.test(fs.readFileSync(path.join(process.cwd(), barrel), 'utf8'))) {
+      throw new Error(`OpenCode registration is missing from ${barrel}`);
+    }
+  }
+  // A new process validates actual registration after setup has refreshed files.
+  // An already-imported setup barrel would otherwise report its old inventory.
+  const inventory = JSON.parse(
+    execFileSync(process.execPath, ['--import', 'tsx', 'scripts/provider-contract-names.ts'], {
+      cwd: process.cwd(),
+      encoding: 'utf8',
+      stdio: 'pipe',
+      timeout: 30_000,
+    }),
+  ) as { host?: string[]; hostProviders?: string[]; setupProviders?: string[] };
+  if (
+    ![inventory.host, inventory.hostProviders, inventory.setupProviders].every((names) => names?.includes('opencode'))
+  ) {
+    throw new Error('OpenCode did not register all host, setup, and contract surfaces. Refresh the provider payload.');
   }
 }
 

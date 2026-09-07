@@ -219,7 +219,7 @@ function prepareReadOnlyFileMountpoint(root: string, relativePath: string): void
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     if (!fs.lstatSync(target).isFile()) {
-      throw new Error('Provider file mountpoint must be a regular file, not a symlink');
+      throw new Error('Provider file mountpoint must be a regular file, not a symlink', { cause: error });
     }
   }
 }

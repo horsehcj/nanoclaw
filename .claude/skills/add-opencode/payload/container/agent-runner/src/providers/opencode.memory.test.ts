@@ -6,17 +6,17 @@ import path from 'path';
 import {
   OpenCodeProvider,
   buildOpenCodeConfig,
-  createCompactionReminder,
-  createMemoryLifecycle,
   runMemorySessionHook,
   type OpenCodeMemorySessionHook,
 } from './opencode.js';
+import memoryPlugin from './opencode-memory-plugin.js';
+import { prepareOpenCodeMemory, readOpenCodeMemory } from './opencode-memory.js';
 
 /**
  * Memory reaches the OpenCode agent through the shared memory session hook —
  * the same command the Claude and Codex providers register — run at the two
- * moments OpenCode rebuilds a context window: a new session, and the first
- * prompt after an auto-compaction. Never on a resume, never on an ordinary
+ * moments OpenCode rebuilds a context window: a new session, and the awaited
+ * compaction hook before native continuation. Never on a resume, never on an ordinary
  * push, and never through the config `instructions` array (OpenCode rereads
  * those files raw on every model request, bypassing the shared renderer's
  * per-file caps and the whole lifecycle).
@@ -95,9 +95,9 @@ describe('runMemorySessionHook', () => {
     expect(out).toHaveLength(40_000);
   });
 
-  it('fails closed on a non-zero exit, an unknown command, empty output, and no registration', () => {
+  it('distinguishes renderer failure from successfully empty output', () => {
     expect(runMemorySessionHook(fakeHook({ exitCode: 3 }), 'startup')).toBeUndefined();
-    expect(runMemorySessionHook(fakeHook({ body: '' }), 'startup')).toBeUndefined();
+    expect(runMemorySessionHook(fakeHook({ body: '' }), 'startup')).toBe('');
     expect(runMemorySessionHook(undefined, 'startup')).toBeUndefined();
     expect(
       runMemorySessionHook(
@@ -114,75 +114,85 @@ describe('runMemorySessionHook', () => {
   });
 });
 
-describe('createMemoryLifecycle new context', () => {
-  it('prepends one memory block to the opening prompt instructions', () => {
-    const lifecycle = createMemoryLifecycle(fakeHook(), false);
-    const instructions = lifecycle.openingInstructions('BASE INSTRUCTIONS');
+describe('native memory hooks', () => {
+  async function plugin() {
+    return memoryPlugin({}, { directory: dir });
+  }
+  async function system(hooks: Awaited<ReturnType<typeof plugin>>, sessionID = 'ses_test') {
+    const output = { system: [] as string[] };
+    await hooks['experimental.chat.system.transform']({ sessionID }, output);
+    return output.system.join('\n');
+  }
 
-    expect(instructions?.split(MARKER)).toHaveLength(2); // exactly one occurrence
-    expect(instructions).toContain('BASE INSTRUCTIONS');
-    expect(instructions?.indexOf(MARKER)).toBeLessThan(instructions!.indexOf('BASE INSTRUCTIONS'));
+  it('seeds startup once and makes cached memory available to every native model request', async () => {
+    prepareOpenCodeMemory('ses_test', fakeHook(), 'CORE', 'ROUTING', true, dir);
+    const hooks = await plugin();
+    expect(await system(hooks)).toBe(`${MARKER}\n\nCORE\n\nROUTING`);
+    expect(await system(hooks)).toBe(`${MARKER}\n\nCORE\n\nROUTING`);
+    expect(invocations()).toEqual(['{"hook_event_name":"SessionStart","source":"startup"}']);
+  });
+
+  it('reuses persisted memory on a cold resume and refreshes current core instructions', async () => {
+    const hook = fakeHook();
+    prepareOpenCodeMemory('ses_test', hook, 'OLD', 'ROUTING', true, dir);
+    prepareOpenCodeMemory('ses_test', hook, 'CURRENT', 'ROUTING', false, dir);
+    const cold = await plugin();
+    expect(await system(cold)).toBe(`${MARKER}\n\nCURRENT\n\nROUTING`);
     expect(invocations()).toHaveLength(1);
   });
 
-  it('carries memory even when the turn has no system instructions', () => {
-    expect(createMemoryLifecycle(fakeHook(), false).openingInstructions(undefined)).toBe(MARKER);
+  it('refreshes in the awaited compaction hook before native continuation, without another external push', async () => {
+    prepareOpenCodeMemory('ses_test', fakeHook(), 'CORE', 'ROUTING', true, dir);
+    prepareOpenCodeMemory('ses_test', fakeHook({ body: 'FRESH' }), 'CORE', 'ROUTING', false, dir);
+    const hooks = await plugin();
+    await hooks['experimental.session.compacting']({ sessionID: 'ses_test' }, { context: [] });
+    expect(await system(hooks)).toBe('FRESH\n\nCORE\n\nROUTING');
+    expect(invocations()).toEqual([
+      '{"hook_event_name":"SessionStart","source":"startup"}',
+      '{"hook_event_name":"SessionStart","source":"compact"}',
+    ]);
   });
 
-  it('does NOT re-inject on ordinary pushes after the opening prompt', () => {
-    const lifecycle = createMemoryLifecycle(fakeHook(), false);
-    lifecycle.openingInstructions('BASE');
-
-    expect(lifecycle.pushPrefix(false)).toBe('');
-    expect(lifecycle.pushPrefix(false)).toBe('');
-    expect(invocations()).toHaveLength(1); // the opening prompt only
+  it('retains the last snapshot on renderer failure but clears successfully emptied memory', async () => {
+    prepareOpenCodeMemory('ses_test', fakeHook(), 'CORE', '', true, dir);
+    const hooks = await plugin();
+    prepareOpenCodeMemory('ses_test', fakeHook({ exitCode: 1 }), 'CORE', '', false, dir);
+    await hooks['experimental.session.compacting']({ sessionID: 'ses_test' }, { context: [] });
+    expect(await system(hooks)).toContain(MARKER);
+    prepareOpenCodeMemory('ses_test', fakeHook({ body: '' }), 'CORE', '', false, dir);
+    await hooks['experimental.session.compacting']({ sessionID: 'ses_test' }, { context: [] });
+    expect(await system(hooks)).toBe('CORE');
   });
 
-  it('never runs the hook when the query resumes an existing session', () => {
-    const lifecycle = createMemoryLifecycle(fakeHook(), true);
+  it('inherits parent memory for task children and persists child compaction separately', async () => {
+    prepareOpenCodeMemory('ses_test', fakeHook(), 'CORE', 'ROUTING', true, dir);
+    prepareOpenCodeMemory('ses_test', fakeHook({ body: 'CHILD FRESH' }), 'CORE', 'ROUTING', false, dir);
+    const hooks = await memoryPlugin(
+      {
+        client: {
+          session: {
+            get: async ({ path }) => ({ data: { parentID: path.id === 'ses_child' ? 'ses_test' : undefined } }),
+          },
+        },
+      },
+      { directory: dir },
+    );
+    expect(await system(hooks, 'ses_child')).toBe(`${MARKER}\n\nCORE\n\nROUTING`);
+    expect(await system(hooks, 'ses_unrelated')).toBe('');
+    await hooks['experimental.session.compacting']({ sessionID: 'ses_child' }, { context: [] });
+    expect(await system(hooks, 'ses_child')).toContain('CHILD FRESH');
+    expect(readOpenCodeMemory('ses_test', dir)?.memory).toBe(MARKER);
+    expect(invocations()).toHaveLength(2);
+  });
 
-    expect(lifecycle.openingInstructions('BASE')).toBe('BASE');
-    expect(lifecycle.pushPrefix(false)).toBe('');
+  it('does not attach session memory to unscoped requests or execute startup on a legacy resume', async () => {
+    prepareOpenCodeMemory('ses_legacy', fakeHook(), 'CORE', '', false, dir);
+    const hooks = await plugin();
+    expect(await system(hooks, 'ses_legacy')).toBe('CORE');
+    const output = { system: [] as string[] };
+    await hooks['experimental.chat.system.transform']({}, output);
+    expect(output.system).toEqual([]);
     expect(invocations()).toEqual([]);
-  });
-
-  it('leaves the instructions untouched when the hook fails', () => {
-    const lifecycle = createMemoryLifecycle(fakeHook({ exitCode: 1 }), false);
-    expect(() => lifecycle.openingInstructions('BASE')).not.toThrow();
-    expect(lifecycle.openingInstructions('BASE')).toBe('BASE');
-  });
-});
-
-describe('createMemoryLifecycle after compaction', () => {
-  it('injects memory once on the first push after a compaction', () => {
-    const lifecycle = createMemoryLifecycle(fakeHook(), false);
-
-    expect(lifecycle.pushPrefix(true)).toBe(`${MARKER}\n\n`);
-    expect(invocations()).toEqual(['{"hook_event_name":"SessionStart","source":"compact"}']);
-  });
-
-  it('rides the compaction latch: memory, then the routing reminder, then the user text', () => {
-    // Mirrors what OpenCodeProvider.push() composes, latch included.
-    const lifecycle = createMemoryLifecycle(fakeHook(), false);
-    const compaction = createCompactionReminder(() => '<<reminder>>');
-    const compose = (message: string): string => {
-      const justCompacted = compaction.isArmed;
-      return lifecycle.pushPrefix(justCompacted) + compaction.apply(message);
-    };
-
-    compaction.note('ses_active', 'ses_active'); // session.compacted for this turn's session
-    const first = compose('next user message');
-    expect(first).toBe(`${MARKER}\n\n<<reminder>>\n\nnext user message`);
-
-    // The push after that is clean — no memory, no reminder.
-    const second = compose('another message');
-    expect(second).toBe('another message');
-    expect(invocations()).toHaveLength(1);
-  });
-
-  it('falls back to no injection when the compaction-time hook fails', () => {
-    const lifecycle = createMemoryLifecycle(fakeHook({ exitCode: 1 }), false);
-    expect(lifecycle.pushPrefix(true)).toBe('');
   });
 });
 
@@ -193,17 +203,12 @@ describe('OpenCodeProvider memory registration', () => {
     );
   });
 
-  it('runs the registered hook when it opens a new session, not when it resumes one', () => {
+  it('does not run startup before the lazy query actually creates a session', () => {
     const provider = new OpenCodeProvider();
     provider.registerMemorySessionHook(fakeHook());
-
-    // query() only composes the opening prompt; the generator is lazy, so no
-    // OpenCode server is touched until `events` is iterated (it is not here).
     provider.query({ prompt: 'hi', cwd: '/workspace' });
-    expect(invocations()).toEqual(['{"hook_event_name":"SessionStart","source":"startup"}']);
-
     provider.query({ prompt: 'hi again', cwd: '/workspace', continuation: 'ses_existing' });
-    expect(invocations()).toHaveLength(1);
+    expect(invocations()).toEqual([]);
   });
 });
 

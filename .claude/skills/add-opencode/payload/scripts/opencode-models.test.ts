@@ -33,7 +33,14 @@ beforeEach(() => {
   process.chdir(directory);
   fs.writeFileSync('.env', initial);
   vi.resetAllMocks();
-  for (const key of ['OPENCODE_PROVIDER', 'OPENCODE_MODEL', 'OPENCODE_AUTH_MODE']) vi.stubEnv(key, undefined);
+  for (const key of [
+    'OPENCODE_PROVIDER',
+    'OPENCODE_MODEL',
+    'OPENCODE_AUTH_MODE',
+    'OPENCODE_BASE_URL',
+    'ANTHROPIC_BASE_URL',
+  ])
+    vi.stubEnv(key, undefined);
   fixture.exec.mockReturnValue(record('openai/new-model') + record('openai/current'));
   fixture.choose.mockResolvedValue('openai/new-model');
 });
@@ -41,9 +48,20 @@ afterEach(() => {
   process.chdir(originalCwd);
   fs.rmSync(directory, { recursive: true, force: true });
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
 });
 
 describe('installed runtime catalog', () => {
+  it('matches runtime fallback when an exported empty endpoint suppresses the saved native setting', async () => {
+    vi.stubEnv('OPENCODE_BASE_URL', '');
+    const transport = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: 'local-model' }] })));
+    vi.stubGlobal('fetch', transport);
+    await runModelSelection(['--list']);
+    expect(transport).toHaveBeenCalledWith(new URL('https://example.test/models'), expect.any(Object));
+    expect(fixture.exec).not.toHaveBeenCalled();
+    expect(contents()).toBe(initial);
+  });
+
   it('filters metadata instead of using a static GPT allowlist', () => {
     const output =
       record('openai/new-future-model') +
@@ -83,6 +101,37 @@ describe('installed runtime catalog', () => {
 });
 
 describe('default model command', () => {
+  it('discovers from the configured local endpoint instead of offering native OpenAI models', async () => {
+    fs.writeFileSync(
+      '.env',
+      initial.replace('OPENCODE_BASE_URL=native', 'OPENCODE_BASE_URL=http://host.docker.internal:8000/v1'),
+    );
+    const request = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: 'qwen-local' }] })));
+    vi.stubGlobal('fetch', request);
+    fixture.choose.mockResolvedValue('openai/qwen-local');
+    await runModelSelection(['--refresh']);
+    expect(request).toHaveBeenCalledWith(new URL('http://127.0.0.1:8000/v1/models'), expect.any(Object));
+    expect(fixture.exec).not.toHaveBeenCalled();
+    expect(fixture.choose.mock.calls[0][0].options).toContainEqual({
+      value: 'openai/qwen-local',
+      label: 'openai/qwen-local',
+    });
+    expect(contents()).toContain('OPENCODE_MODEL=openai/qwen-local');
+  });
+  it('uses manual/current choices when a custom catalog is unavailable, without native fallback', async () => {
+    fs.writeFileSync('.env', initial.replace('OPENCODE_BASE_URL=native', 'OPENCODE_BASE_URL=http://127.0.0.1:8000/v1'));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('unauthorized', { status: 401 })),
+    );
+    fixture.choose.mockResolvedValue('openai/current');
+    await runModelSelection(['--refresh']);
+    expect(fixture.exec).not.toHaveBeenCalled();
+    expect(fixture.choose.mock.calls[0][0].options.map((entry: { value: string }) => entry.value)).toEqual([
+      'openai/current',
+      '__manual_model__',
+    ]);
+  });
   it('changes only the main default and preserves all other bytes in .env', async () => {
     await runModelSelection(['--model', 'openai/new-model']);
     expect(contents()).toBe(initial.replace('OPENCODE_MODEL=openai/current', 'OPENCODE_MODEL=openai/new-model'));

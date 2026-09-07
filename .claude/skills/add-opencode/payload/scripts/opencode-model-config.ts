@@ -5,6 +5,50 @@ import { CONTAINER_IMAGE } from '../src/config.js';
 import { CONTAINER_RUNTIME_BIN } from '../src/container-runtime.js';
 import { buildOneCliManagedStub } from '../src/providers/opencode-auth-stub.js';
 
+const MAX_MODEL_DISCOVERY_BYTES = 1024 * 1024;
+
+/** Probe a container-facing OpenAI-compatible URL from the host setup process. */
+export async function discoverLocalModelIds(
+  baseUrl: string,
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<string[]> {
+  const url = new URL(baseUrl);
+  if (url.hostname === 'host.docker.internal') url.hostname = '127.0.0.1';
+  url.pathname = `${url.pathname.replace(/\/$/, '')}/models`;
+  url.search = '';
+  url.hash = '';
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const response = await fetchImpl(url, { signal: controller.signal, redirect: 'error' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const declaredLength = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_MODEL_DISCOVERY_BYTES) {
+      throw new Error('response is too large');
+    }
+    const body = await response.text();
+    if (Buffer.byteLength(body, 'utf8') > MAX_MODEL_DISCOVERY_BYTES) throw new Error('response is too large');
+    const payload = JSON.parse(body) as unknown;
+    if (!payload || typeof payload !== 'object' || !Array.isArray((payload as Record<string, unknown>).data)) {
+      throw new Error('response has no data array');
+    }
+    return [
+      ...new Set(
+        ((payload as Record<string, unknown>).data as unknown[])
+          .flatMap((entry) => {
+            if (!entry || typeof entry !== 'object') return [];
+            const id = (entry as Record<string, unknown>).id;
+            return typeof id === 'string' && id.trim() ? [id.trim()] : [];
+          })
+          .sort((a, b) => a.localeCompare(b)),
+      ),
+    ];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 const MANUAL_MODEL = '__manual_model__';
 
 export function validateModel(model: string, provider: string): string | undefined {

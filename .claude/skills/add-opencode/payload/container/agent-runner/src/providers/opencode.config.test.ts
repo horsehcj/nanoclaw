@@ -22,6 +22,9 @@ afterEach(() => {
 });
 
 describe('buildOpenCodeConfig provider transport', () => {
+  it('allows the core five-minute human-question window plus transport overhead', () => {
+    expect(buildOpenCodeConfig({}).experimental).toMatchObject({ mcp_timeout: 330_000 });
+  });
   it('treats a custom provider prefix literally rather than as a regular expression', () => {
     process.env.OPENCODE_PROVIDER = 'local[1]';
     process.env.OPENCODE_MODEL = 'local[1]/model';

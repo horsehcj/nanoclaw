@@ -13,9 +13,11 @@
  * their auth step so there is exactly one auth implementation per provider.
  */
 import { buildContainerImage } from './lib/container-build.js';
+import * as p from '@clack/prompts';
+import { HARDENED_IMAGE_ENV_KEY, readImageSource, writeImageSource } from './lib/registry-state.js';
 import { getSetupProvider, listSetupProviders } from './providers/registry.js';
 import { applyProviderSkill } from './providers/install.js';
-import { getInstallableProviderDescriptor } from './providers/skill-descriptor.js';
+import { getInstallableProviderDescriptor, providerImagePolicy } from './providers/skill-descriptor.js';
 // Provider payloads self-register on import.
 import './providers/index.js';
 
@@ -34,6 +36,20 @@ export async function run(args: string[]): Promise<void> {
   let entry = getSetupProvider(name);
   const skillDir = getInstallableProviderDescriptor(name)?.skillDir;
   if (skillDir) {
+    if (providerImagePolicy(name) === 'local-required' && readImageSource() === 'hardened') {
+      if (process.env[HARDENED_IMAGE_ENV_KEY]?.trim().toLowerCase() === 'true') {
+        throw new Error(
+          `Unset exported ${HARDENED_IMAGE_ENV_KEY} before installing a provider that requires a local image.`,
+        );
+      }
+      const local = await p.confirm({
+        message: `${name} needs a sandbox image built on this machine. Stop using the pre-built one?`,
+        initialValue: true,
+      });
+      if (p.isCancel(local) || !local)
+        throw new Error('Provider installation cancelled; the existing image and payload are unchanged.');
+      writeImageSource('local');
+    }
     // Install OR refresh: the skill is idempotent and is also the upgrade path
     // — payload files resync and a bumped CLI-manifest pin replaces the local
     // one. Applied in-process via the directive engine; build + auth are this
@@ -58,7 +74,8 @@ export async function run(args: string[]): Promise<void> {
       }
     }
     if (!entry) {
-      await import(`./providers/${name}.js`);
+      const installedModule = `./providers/${name}.js`;
+      await import(installedModule);
       entry = getSetupProvider(name);
     }
     if (!entry) {

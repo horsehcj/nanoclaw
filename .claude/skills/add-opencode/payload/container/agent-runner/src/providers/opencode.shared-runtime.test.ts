@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 import type { ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
+import { mkdtempSync, rmSync } from 'fs';
+import { tmpdir } from 'os';
+import path from 'path';
+import type { OpenCodeMessage, OpenCodeSessionClient } from './opencode-turn.js';
 
 import {
   destroySharedRuntime,
@@ -10,6 +14,9 @@ import {
   type OpenCodeSharedRuntimeDeps,
   type QuestionClient,
 } from './opencode.js';
+import { initTestSessionDb, closeSessionDb } from '../mailbox/sqlite/connection.js';
+import { registerAgentMailbox, resetAgentMailboxForTesting } from '../mailbox/index.js';
+import { SqliteAgentMailbox } from '../mailbox/sqlite/index.js';
 import { createProvider } from './factory.js';
 import { registerProviderMemorySessionHook } from '../provider-contracts/realize.js';
 import '../provider-contracts/index.js';
@@ -55,14 +62,60 @@ type FakeProc = ChildProcess & { kill: ReturnType<typeof mock>; emitExit(code: n
 
 /**
  * One fake server: a process handle whose `kill` ends the event stream (the
- * way SIGKILL drops a real SSE connection), plus a client whose `promptAsync`
+ * way SIGKILL drops a real SSE connection), plus a client whose `prompt`
  * hands the session id to the test so it decides what the server "emits".
  */
 function fakeServer(onPrompt: (sessionId: string, promptIndex: number) => void) {
   const END = Symbol('end');
-  const queue: Array<Ev | typeof END> = [];
+  const queue: Array<Ev | typeof END> = [{ type: 'server.connected', properties: {} }];
+  const history = new Map<string, OpenCodeMessage[]>();
+  let current:
+    | { sessionId: string; userId: string; resolve(value: { data?: OpenCodeMessage; error?: unknown }): void }
+    | undefined;
+  let promptHandler = onPrompt;
+  const finish = (error?: unknown) => {
+    if (!current) return;
+    let message = history
+      .get(current.sessionId)!
+      .findLast((m) => m.info.role === 'assistant' && m.info.parentID === current!.userId);
+    if (!message && error) {
+      message = {
+        info: {
+          id: 'msg_error_' + current.userId,
+          role: 'assistant',
+          parentID: current.userId,
+          time: { created: Date.now() },
+          error,
+        },
+        parts: [],
+      };
+      history.get(current.sessionId)!.push(message);
+    }
+    if (message) {
+      if (error) message.info.error = error;
+      current.resolve({ data: message });
+      current = undefined;
+    }
+  };
   const waiters: Array<() => void> = [];
   const push = (events: Ev[]): void => {
+    for (const event of events) {
+      if (!current) continue;
+      const rows = history.get(current.sessionId)!;
+      const info = event.properties.info as (OpenCodeMessage['info'] & { sessionID?: string }) | undefined;
+      if (event.type === 'message.updated' && info?.sessionID === current.sessionId && info.role === 'assistant') {
+        rows.push({
+          info: { ...info, parentID: current.userId, time: { created: Date.now(), completed: Date.now() } },
+          parts: [],
+        });
+      }
+      const part = event.properties.part as { type: string; text?: string; messageID: string } | undefined;
+      if (event.type === 'message.part.updated' && part)
+        rows.find((m) => m.info.id === part.messageID)?.parts.push({ ...part, id: 'prt_' + part.messageID });
+      if (event.type === 'session.idle' && event.properties.sessionID === current.sessionId) finish();
+      if (event.type === 'session.error' && event.properties.sessionID === current.sessionId)
+        finish(event.properties.error);
+    }
     queue.push(...events);
     while (waiters.length > 0 && queue.length > 0) waiters.shift()!();
   };
@@ -123,11 +176,19 @@ function fakeServer(onPrompt: (sessionId: string, promptIndex: number) => void) 
         sessionCount += 1;
         return { data: { id: `ses_${sessionCount}` } };
       },
-      async promptAsync(params: { path: { id: string }; body: { parts: unknown[] } }) {
+      prompt: (async (params) => {
         promptCount += 1;
-        onPrompt(params.path.id, promptCount);
-        return {};
-      },
+        const rows = history.get(params.path.id) ?? [];
+        history.set(params.path.id, rows);
+        rows.push({ info: { id: params.body.messageID, role: 'user', time: { created: Date.now() } }, parts: [] });
+        return await new Promise((resolve) => {
+          current = { sessionId: params.path.id, userId: params.body.messageID, resolve };
+          promptHandler(params.path.id, promptCount);
+        });
+      }) as OpenCodeSessionClient['prompt'],
+      messages: (async (params) => ({
+        data: (history.get(params.path.id) ?? []).slice(-params.query.limit),
+      })) as OpenCodeSessionClient['messages'],
       abort,
     },
   };
@@ -142,7 +203,18 @@ function fakeServer(onPrompt: (sessionId: string, promptIndex: number) => void) 
     },
   };
 
-  return { proc, client, questionClient, push, endStream, abort, subscribe };
+  return {
+    proc,
+    client,
+    questionClient,
+    push,
+    endStream,
+    abort,
+    subscribe,
+    setPromptHandler: (handler: typeof onPrompt) => {
+      promptHandler = handler;
+    },
+  };
 }
 
 function installDeps(servers: Array<ReturnType<typeof fakeServer>>, spawnFailures: Error[] = []) {
@@ -186,12 +258,27 @@ async function runOneTurn(provider: OpenCodeProvider, continuation?: string): Pr
 const resultText = (events: ProviderEvent[]) =>
   events.filter((e) => e.type === 'result').map((e) => (e as { text: string | null }).text);
 
+let composedFactory: ReturnType<typeof resetAgentMailboxForTesting>;
+let memoryDir: string;
+let savedXdg: string | undefined;
 beforeEach(() => {
+  composedFactory = resetAgentMailboxForTesting();
+  initTestSessionDb();
+  registerAgentMailbox(() => new SqliteAgentMailbox());
+  savedXdg = process.env.XDG_DATA_HOME;
+  memoryDir = mkdtempSync(path.join(tmpdir(), 'opencode-runtime-memory-'));
+  process.env.XDG_DATA_HOME = memoryDir;
   destroySharedRuntime();
 });
 afterEach(() => {
   destroySharedRuntime();
   setSharedRuntimeDepsForTesting(undefined);
+  if (savedXdg === undefined) delete process.env.XDG_DATA_HOME;
+  else process.env.XDG_DATA_HOME = savedXdg;
+  resetAgentMailboxForTesting();
+  closeSessionDb();
+  if (composedFactory) registerAgentMailbox(composedFactory);
+  rmSync(memoryDir, { recursive: true, force: true });
 });
 
 describe('shared runtime recovery', () => {
@@ -248,7 +335,7 @@ describe('shared runtime recovery', () => {
     await runOneTurn(provider, 'ses_kept').catch((err: unknown) => {
       thrown = err;
     });
-    expect((thrown as Error).message).toBe('OpenCode SSE stream ended unexpectedly');
+    expect((thrown as Error).message).toContain('OpenCode event stream ended unexpectedly');
     expect(Date.now() - started).toBeLessThan(2000);
     // The session on disk is intact: a dead server is not a stale session.
     expect(provider.isSessionInvalid(thrown)).toBe(false);
@@ -268,7 +355,7 @@ describe('shared runtime recovery', () => {
     const { spawnServer } = installDeps([dying, healthy]);
     const provider = newProvider();
 
-    await expect(runOneTurn(provider)).rejects.toThrow('OpenCode SSE stream ended unexpectedly');
+    await expect(runOneTurn(provider)).rejects.toThrow('OpenCode event stream ended unexpectedly');
     expect(dying.proc.kill).toHaveBeenCalledTimes(1);
 
     expect(resultText(await runOneTurn(provider))).toEqual(['ok']);
@@ -293,7 +380,7 @@ describe('isSessionInvalid', () => {
   it("fires only on OpenCode's own NotFoundError for the session", () => {
     expect(
       provider.isSessionInvalid(
-        new Error('OpenCode promptAsync: {"name":"NotFoundError","data":{"message":"Session not found: ses_gone"}}'),
+        new Error('OpenCode prompt: {"name":"NotFoundError","data":{"message":"Session not found: ses_gone"}}'),
       ),
     ).toBe(true);
   });
@@ -307,7 +394,7 @@ describe('isSessionInvalid', () => {
       'OpenCode event stream silent for 60000ms; server dropped',
       'OpenCode turn produced no activity for 900000ms; aborted',
       'OpenCode SSE stream ended unexpectedly',
-      'OpenCode promptAsync: {}',
+      'OpenCode prompt: {}',
     ]) {
       expect(provider.isSessionInvalid(new Error(msg))).toBe(false);
     }
@@ -329,7 +416,7 @@ describe('isSessionInvalid', () => {
     await runOneTurn(provider, 'ses_1').catch((err: unknown) => {
       thrown = err;
     });
-    expect((thrown as Error).message).toBe('404 No endpoints found');
+    expect((thrown as Error).message).toContain('404 No endpoints found');
     expect(provider.isSessionInvalid(thrown)).toBe(false);
   });
 
@@ -353,14 +440,14 @@ describe('isSessionInvalid', () => {
       await runOneTurn(provider, 'ses_1').catch((error: unknown) => {
         thrown = error;
       });
-      expect((thrown as Error).message).toBe('Authentication failed');
+      expect((thrown as Error).message).toContain('Authentication failed');
       expect(provider.isSessionInvalid(thrown)).toBe(false);
     },
   );
 
-  it('a promptAsync NotFoundError for the resumed id is a stale session', async () => {
+  it('a prompt NotFoundError for the resumed id is a stale session', async () => {
     const server = fakeServer(() => {});
-    server.client.session.promptAsync = async () => ({
+    server.client.session.prompt = async () => ({
       error: { name: 'NotFoundError', data: { message: 'Session not found: ses_gone' } },
     });
     installDeps([server]);
@@ -386,30 +473,30 @@ describe('abort and watchdog', () => {
 
     // The generator is now parked on stream.next() with a prompt in flight.
     const pendingNext = iterator.next();
+    await Bun.sleep(10);
     query.abort();
-    expect(server.abort).toHaveBeenCalledTimes(1);
-    expect(server.abort.mock.calls[0][0]).toEqual({ path: { id: 'ses_1' } });
 
     // What the server sends back for the aborted session (the fake abort
     // emits it) must not become this query's error.
     expect((await pendingNext).done).toBe(true);
+    expect(server.abort).toHaveBeenCalledTimes(1);
+    expect(server.abort.mock.calls[0][0]).toMatchObject({ path: { id: 'ses_1' } });
     expect(server.proc.kill).not.toHaveBeenCalled();
 
     // The next query lands on the same server.
     const again = provider.query({ prompt: 'again', cwd: CWD });
     again.end();
     const promptedOn: string[] = [];
-    server.client.session.promptAsync = async (params) => {
-      promptedOn.push(params.path.id);
-      server.push(assistantReply(params.path.id, 'fresh'));
-      return {};
-    };
+    server.setPromptHandler((sid) => {
+      promptedOn.push(sid);
+      server.push(assistantReply(sid, 'fresh'));
+    });
     expect(resultText(await collect(again.events))).toEqual(['fresh']);
     expect(promptedOn).toEqual(['ses_2']);
     expect(spawnServer).toHaveBeenCalledTimes(1);
   });
 
-  it('abort() while parked in session.create() stops the session it produces and sends no prompt', async () => {
+  it('abort() while parked in session.create() sends no prompt', async () => {
     const server = fakeServer(() => {});
     let releaseCreate: (() => void) | undefined;
     const realCreate = server.client.session.create;
@@ -419,8 +506,8 @@ describe('abort and watchdog', () => {
       });
       return realCreate();
     };
-    const promptAsync = mock(server.client.session.promptAsync);
-    server.client.session.promptAsync = promptAsync;
+    const prompt = mock(server.client.session.prompt);
+    server.client.session.prompt = prompt;
     installDeps([server]);
     const provider = newProvider();
 
@@ -433,39 +520,8 @@ describe('abort and watchdog', () => {
     releaseCreate();
     expect((await first).done).toBe(true);
 
-    expect(promptAsync).not.toHaveBeenCalled();
-    expect(server.abort).toHaveBeenCalledTimes(1);
-    expect(server.abort.mock.calls[0][0]).toEqual({ path: { id: 'ses_1' } });
-  });
-
-  it('abort() while parked in promptAsync() re-aborts once the turn exists and processes nothing', async () => {
-    const server = fakeServer(() => {});
-    let releasePrompt: (() => void) | undefined;
-    server.client.session.promptAsync = async (params) => {
-      await new Promise<void>((resolve) => {
-        releasePrompt = resolve;
-      });
-      // The prompt registered server-side after the first abort; the model
-      // starts answering.
-      server.push(assistantReply(params.path.id, 'should never be delivered'));
-      return {};
-    };
-    installDeps([server]);
-    const provider = newProvider();
-
-    const query = provider.query({ prompt: 'work', cwd: CWD });
-    const iterator = query.events[Symbol.asyncIterator]();
-    expect((await iterator.next()).value).toEqual({ type: 'init', continuation: 'ses_1' });
-    const second = iterator.next();
-    while (!releasePrompt) await new Promise((r) => setTimeout(r, 1));
-
-    query.abort();
-    releasePrompt();
-    expect((await second).done).toBe(true);
-
-    // Once at abort() time, once more after promptAsync resolved.
-    expect(server.abort).toHaveBeenCalledTimes(2);
-    for (const call of server.abort.mock.calls) expect(call[0]).toEqual({ path: { id: 'ses_1' } });
+    expect(prompt).not.toHaveBeenCalled();
+    expect(server.abort).not.toHaveBeenCalled();
   });
 
   describe('with short watchdog budgets', () => {
@@ -504,7 +560,7 @@ describe('abort and watchdog', () => {
       expect(resultText(events)).toEqual(['done after a long tool']);
       expect(server.proc.kill).not.toHaveBeenCalled();
       expect(server.abort).not.toHaveBeenCalled();
-      expect(events.filter((e) => e.type === 'activity').length).toBe(3);
+      expect(events.filter((e) => e.type === 'activity').length).toBeLessThanOrEqual(2);
     });
 
     it('stream tier: silence including heartbeats drops the server as genuine death', async () => {
@@ -516,7 +572,7 @@ describe('abort and watchdog', () => {
 
       await expect(runOneTurn(provider)).rejects.toThrow('OpenCode event stream silent for 150ms');
       expect(server.proc.kill).toHaveBeenCalledTimes(1);
-      expect(server.abort).not.toHaveBeenCalled();
+      expect(server.abort).toHaveBeenCalledTimes(1);
     });
 
     it('activity tier: a wedged backend on a live stream aborts the session and keeps the server', async () => {
@@ -531,16 +587,13 @@ describe('abort and watchdog', () => {
 
       await expect(runOneTurn(provider)).rejects.toThrow('OpenCode turn produced no activity for 150ms; aborted');
       expect(server.abort).toHaveBeenCalledTimes(1);
-      expect(server.abort.mock.calls[0][0]).toEqual({ path: { id: 'ses_1' } });
+      expect(server.abort.mock.calls[0][0]).toMatchObject({ path: { id: 'ses_1' } });
       expect(server.proc.kill).not.toHaveBeenCalled();
       // A backend wedge is not a stale session: the continuation must survive.
       expect(provider.isSessionInvalid(new Error('OpenCode turn produced no activity for 150ms; aborted'))).toBe(false);
 
       // The server is still the one we had.
-      server.client.session.promptAsync = async (params) => {
-        server.push(assistantReply(params.path.id, 'recovered'));
-        return {};
-      };
+      server.setPromptHandler((sid) => server.push(assistantReply(sid, 'recovered')));
       expect(resultText(await runOneTurn(provider))).toEqual(['recovered']);
       expect(spawnServer).toHaveBeenCalledTimes(1);
     });

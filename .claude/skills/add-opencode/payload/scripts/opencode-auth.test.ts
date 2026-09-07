@@ -165,6 +165,7 @@ const secretMetadata = {
   type: 'openai',
   hostPattern: 'chatgpt.com',
   valueSource: 'inline',
+  scope: 'project',
   metadata: { authMode: 'oauth' },
   pathPattern: null,
 };
@@ -200,7 +201,7 @@ describe('ChatGPT vault recovery', () => {
     const vault = createChatGptVault('https://gateway.example', 'management-fixture', fetchImpl as typeof fetch);
     expect(await vault.find()).toBe('secret-existing');
     await vault.save({ tokens: { refresh_token: 'refresh-fixture' } }, 'secret-existing');
-    const [url, options] = fetchImpl.mock.calls[1];
+    const [url, options] = fetchImpl.mock.calls.find(([, init]) => init?.method === 'PATCH')!;
     expect(url).toBe('https://gateway.example/v1/secrets/secret-existing');
     expect(options).toMatchObject({
       method: 'PATCH',
@@ -214,7 +215,10 @@ describe('ChatGPT vault recovery', () => {
   });
 
   it('creates a credential only when no existing ID was found', async () => {
-    const fetchImpl = vi.fn(async () => new Response('{}'));
+    const fetchImpl = vi.fn(
+      async (_url: string, init?: RequestInit) =>
+        new Response(JSON.stringify(init?.method === 'GET' ? [] : { id: 'created-fixture' })),
+    );
     await createChatGptVault('http://localhost:10255', '', fetchImpl).save({ tokens: {} }, null);
     expect(fetchImpl).toHaveBeenCalledWith(
       'http://localhost:10255/v1/secrets',
@@ -223,6 +227,7 @@ describe('ChatGPT vault recovery', () => {
         body: JSON.stringify({
           name: 'OpenCode ChatGPT',
           type: 'openai',
+          valueSource: 'inline',
           hostPattern: 'chatgpt.com',
           value: '{"tokens":{}}',
         }),
@@ -436,8 +441,16 @@ describe('OpenCode installation preflight', () => {
     try {
       for (const file of [
         'src/providers/opencode.ts',
+        'src/provider-contracts/opencode.ts',
+        'setup/providers/opencode.ts',
+        'container/agent-runner/src/provider-contracts/opencode.ts',
         'container/agent-runner/src/providers/opencode.ts',
+        'container/agent-runner/src/providers/opencode-config.ts',
+        'container/agent-runner/src/providers/opencode-turn.ts',
+        'container/agent-runner/src/providers/opencode-memory.ts',
+        'container/agent-runner/src/providers/opencode-memory-plugin.ts',
         'container/agent-runner/src/providers/mcp-to-opencode.ts',
+        'scripts/opencode-vault.ts',
       ]) {
         fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
         fs.writeFileSync(path.join(root, file), '');
@@ -450,7 +463,21 @@ describe('OpenCode installation preflight', () => {
       fs.writeFileSync(manifest, JSON.stringify({ dependencies: { '@opencode-ai/sdk': '1.4.17' } }));
       await expect(checkOpenCodeInstall()).rejects.toThrow('SDK must be pinned');
       fs.writeFileSync(manifest, JSON.stringify({ dependencies: { '@opencode-ai/sdk': '1.18.25' } }));
+      for (const barrel of [
+        'src/providers/index.ts',
+        'src/provider-contracts/index.ts',
+        'setup/providers/index.ts',
+        'container/agent-runner/src/providers/index.ts',
+        'container/agent-runner/src/provider-contracts/index.ts',
+      ]) {
+        fs.writeFileSync(path.join(root, barrel), "import './opencode.js';\n");
+      }
+      proc.execFileSync.mockReturnValue(
+        JSON.stringify({ host: ['opencode'], hostProviders: ['opencode'], setupProviders: ['opencode'] }),
+      );
       await expect(checkOpenCodeInstall()).resolves.toBeUndefined();
+      fs.writeFileSync(path.join(root, 'setup/providers/index.ts'), '');
+      await expect(checkOpenCodeInstall()).rejects.toThrow('registration is missing');
     } finally {
       cwd.mockRestore();
       fs.rmSync(root, { recursive: true, force: true });

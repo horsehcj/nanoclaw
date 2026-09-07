@@ -178,6 +178,10 @@ export function buildOpenCodeConfig(
     mcp: configuration ? configuration.mcpServers : mcpServersToOpenCodeConfig(options.mcpServers),
     autoupdate: false,
     snapshot: false,
+    // Core's human-question tool waits up to five minutes. This request budget
+    // leaves room for delivery/polling; MCP connection startup keeps its own limit.
+    experimental: { mcp_timeout: 330_000 },
+    plugin: [new URL('./opencode-memory-plugin.ts', import.meta.url).href],
     // Memory is rendered by the shared session hook at startup and compaction.
     // These files are the core-composed project and local instructions only.
     instructions: [`${AGENT_DIR}/CLAUDE.md`, `${AGENT_DIR}/CLAUDE.local.md`],
