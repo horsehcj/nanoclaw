@@ -70,6 +70,7 @@ import {
   type ImageSource,
 } from './lib/registry-state.js';
 import { upsertEnvVar } from './set-env.js';
+import { selectHostMaintenance } from './maintenance.js';
 import { applyToEnv, parseFlags, printHelp, readFromEnv } from './lib/setup-config-parse.js';
 import { runAdvancedScreen } from './lib/setup-config-screen.js';
 import { runWindowedStep } from './lib/windowed-runner.js';
@@ -221,6 +222,18 @@ async function main(): Promise<void> {
     }
   }
 
+  // Choose the runtime before fallible installation work so it can also be
+  // the suggested host assistant. Group defaults are saved only after auth.
+  let agentProvider: string | undefined;
+  if (!skip.has('auth')) {
+    agentProvider = await askAgentProviderChoice();
+    // Preserve the validated choice, including Claude, across retry/sg re-execs.
+    // The group-creation pick intentionally omits Claude and cannot do this.
+    process.env.NANOCLAW_AGENT_PROVIDER = agentProvider;
+    setPickedProvider(agentProvider);
+  }
+  await selectHostMaintenance(agentProvider);
+
   if (!skip.has('environment')) {
     const res = await runQuietStep('environment', {
       running: 'Checking your system…',
@@ -256,7 +269,7 @@ async function main(): Promise<void> {
       brandBody(dimWrap('Your assistant lives in its own sandbox. It can only see what you explicitly share.', 4)),
     );
     // Asked before the step runs, because the step is what acts on the answer.
-    await chooseImageSource();
+    await chooseImageSource(agentProvider);
     p.log.message(
       brandBody(
         dimWrap(
@@ -413,20 +426,11 @@ async function main(): Promise<void> {
     }
   }
 
-  let agentProvider: string | undefined;
   if (!skip.has('auth')) {
-    // Agent runtime pick. Claude is the default and a no-op — choosing it
-    // runs the existing Claude auth flow unchanged. A branch provider walks
-    // its own auth (e.g. Codex: ChatGPT subscription or API key, vault-only)
-    // and verifies its payload is wired. The pick installs and authenticates
-    // the runtime; it is NOT an install-wide default — and it is NOT a
-    // creation flag. Provider is a DB property of a group: the creation flows
-    // create provider-agnostic groups, and setup sets the picked provider on
-    // each via `ncl groups config update --provider` right after creating it
-    // (the creation scripts inherit it and apply at create — see picked-provider). Existing groups switch the
-    // same way (docs/provider-migration.md).
-    agentProvider = await askAgentProviderChoice();
-    setPickedProvider(agentProvider);
+    // Install and authenticate the runtime selected before environment checks.
+    // Successful auth persists the default for new groups. Existing groups keep
+    // their own provider until explicitly migrated (docs/provider-migration.md).
+    if (!agentProvider) throw new Error('Setup provider selection is missing');
 
     // A pulled image bakes /app/node_modules and the CLI manifest, and every
     // non-claude runtime changes one of them — so it needs an image this
@@ -779,7 +783,7 @@ async function main(): Promise<void> {
   const rows: [string, string][] = [
     ['Chat in the terminal:', 'pnpm run chat hi'],
     ["See what's happening:", 'tail -f logs/nanoclaw.log'],
-    ['Open Claude Code:', 'claude'],
+    ['Maintain this installation:', 'pnpm run maintain'],
   ];
   const labelWidth = Math.max(...rows.map(([l]) => l.length));
   const nextSteps = rows.map(([l, c]) => `${k.cyan(l.padEnd(labelWidth))}  ${c}`).join('\n');
@@ -1287,13 +1291,13 @@ async function askNewTemplateAgentName(agents: readonly AgentGroup[], initialVal
  * Returns having done nothing when the question is already settled, which also
  * covers `NANOCLAW_HARDENED_IMAGE=true` passed in by a packaged flow.
  */
-async function chooseImageSource(): Promise<void> {
+async function chooseImageSource(runtimeProvider?: string): Promise<void> {
   if (imageSourceDecided()) return;
 
-  // The runtime pick happens later (the auth step), so this is the best signal
-  // available: an explicit preset, else the persisted install-wide default.
-  // Getting it wrong in the permissive direction is caught at that pick.
+  // The runtime choice is known before image policy. Resume paths can fall back
+  // to an explicit preset or the persisted installation default.
   const plannedProvider = (
+    runtimeProvider ||
     process.env.NANOCLAW_AGENT_PROVIDER?.trim() ||
     DEFAULT_AGENT_PROVIDER ||
     'claude'

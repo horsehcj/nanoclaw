@@ -140,6 +140,14 @@ export const CONFIG: Entry[] = [
     type: 'string',
   },
   {
+    key: 'hostProvider',
+    envVar: 'NANOCLAW_HOST_PROVIDER',
+    label: 'Host coding agent',
+    help: 'Select host maintenance independently of agent groups; use none to disable assistance.',
+    surface: 'flag',
+    type: 'string',
+  },
+  {
     key: 'assistMode',
     envVar: 'NANOCLAW_SETUP_ASSIST_MODE',
     label: 'Assist mode',

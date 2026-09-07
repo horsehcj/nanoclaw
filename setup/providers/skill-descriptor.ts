@@ -11,6 +11,8 @@ export interface InstallableProviderDescriptor {
   image: 'local-required' | 'hardened-compatible';
   offered: boolean;
   skillDir: string;
+  /** Audited, side-effect-free module inside this skill, usable before apply. */
+  hostHarnessModule?: string;
 }
 
 const PREFIX = 'nanoclaw-provider-';
@@ -96,7 +98,19 @@ export function parseProviderDescriptor(
   if (image !== 'local-required' && image !== 'hardened-compatible') {
     throw new Error(`${directory}: invalid provider image policy '${image}'`);
   }
-  return { value, label, hint, installSkill: directory, image, offered: offered === 'true' };
+  const hostHarnessModule = text(metadata?.[`${PREFIX}host-harness-module`]);
+  if (hostHarnessModule && !/^(?:[a-zA-Z0-9_-]+\/)*[a-zA-Z0-9_-]+\.(?:ts|js|mjs)$/.test(hostHarnessModule)) {
+    throw new Error(`${directory}: invalid host harness module path`);
+  }
+  return {
+    value,
+    label,
+    hint,
+    installSkill: directory,
+    image,
+    offered: offered === 'true',
+    ...(hostHarnessModule ? { hostHarnessModule } : {}),
+  };
 }
 
 function required(metadata: Record<string, unknown> | undefined, key: string, directory: string): string {

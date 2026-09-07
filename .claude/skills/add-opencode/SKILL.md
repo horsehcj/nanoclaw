@@ -7,6 +7,7 @@ metadata:
   nanoclaw-provider-hint: Open-source provider router
   nanoclaw-provider-offered: 'true'
   nanoclaw-provider-image: local-required
+  nanoclaw-provider-host-harness-module: payload/scripts/opencode-host.ts
 ---
 
 # OpenCode agent provider
@@ -24,12 +25,21 @@ transport are separate work.
 
 ## Install
 
-Install and refresh require host contract version 2. The compatibility predicate
+For host maintenance, run `pnpm run maintain -- --configure` and choose OpenCode.
+Install its host CLI when offered, then use native `/connect` and `/models` to
+configure a host model connection. Keep any existing native OpenCode settings.
+Host sign-in is independent of the container's OneCLI credentials, so it can
+help repair an unavailable gateway or container. For a custom endpoint, configure
+the endpoint in OpenCode using its [provider guide](https://opencode.ai/docs/providers/).
+Run `pnpm run maintain -- --update` or `--debug` to follow the corresponding
+operational skill. See the [host maintenance contract](../../../../docs/provider-host-maintenance.md).
+
+Install and refresh require host contract version 2 and host harness seam version 1. The compatibility predicate
 below guards every subsequent step, so an older core receives no partial payload
 or dependency changes. Update core first if it reports a missing prerequisite.
 
 ```nc:run effect:refresh capture:opencode_core_ready validate:^yes$
-node -e "const fs=require('fs'); const p='src/provider-contracts/registry.ts'; if(fs.existsSync(p) && /PROVIDER_HOST_CONTRACT_SEAM_VERSION = 2/.test(fs.readFileSync(p,'utf8'))) console.log('yes'); else console.log('no')"
+node -e "const fs=require('fs'); const p='src/provider-contracts/registry.ts'; const h='setup/providers/host-harness-contract.ts'; if(fs.existsSync(p) && /PROVIDER_HOST_CONTRACT_SEAM_VERSION = 2/.test(fs.readFileSync(p,'utf8')) && fs.existsSync(h) && /HOST_HARNESS_SEAM_VERSION = 1/.test(fs.readFileSync(h,'utf8'))) console.log('yes'); else console.log('no')"
 ```
 
 Copy every file under this skill's `payload/` to the matching path at the project
@@ -61,6 +71,8 @@ payload/container/agent-runner/src/providers/opencode.ts -> container/agent-runn
 payload/scripts/opencode-auth-config.test.ts -> scripts/opencode-auth-config.test.ts
 payload/scripts/opencode-auth.test.ts -> scripts/opencode-auth.test.ts
 payload/scripts/opencode-auth.ts -> scripts/opencode-auth.ts
+payload/scripts/opencode-host.ts -> scripts/opencode-host.ts
+payload/scripts/opencode-host.test.ts -> scripts/opencode-host.test.ts
 payload/scripts/opencode-model-config.ts -> scripts/opencode-model-config.ts
 payload/scripts/opencode-models.test.ts -> scripts/opencode-models.test.ts
 payload/scripts/opencode-models.ts -> scripts/opencode-models.ts
@@ -128,7 +140,7 @@ cd container/agent-runner && bun run typecheck
 ```
 
 ```nc:run effect:test when:opencode_core_ready=yes
-pnpm exec vitest run src/providers/opencode-registration.test.ts scripts/opencode-auth*.test.ts scripts/opencode-models.test.ts scripts/opencode-vault.test.ts setup/providers
+pnpm exec vitest run src/providers/opencode-registration.test.ts scripts/opencode-auth*.test.ts scripts/opencode-host.test.ts scripts/opencode-models.test.ts scripts/opencode-vault.test.ts setup/providers setup/lib/host-maintenance.test.ts setup/lib/host-handoff-routing.test.ts setup/maintenance.test.ts
 ```
 
 ```nc:run effect:test when:opencode_core_ready=yes

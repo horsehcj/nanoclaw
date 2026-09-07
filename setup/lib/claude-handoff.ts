@@ -46,7 +46,7 @@ import {
   offerClaudeAssist,
   STEP_FILES,
 } from './claude-assist.js';
-import { getPickedProvider } from './picked-provider.js';
+import { getHostMaintenanceProvider, offerHostMaintenance } from './host-maintenance.js';
 import { ensureAnswer } from './runner.js';
 import { brandBody, note } from './theme.js';
 
@@ -83,6 +83,13 @@ export interface HandoffContext {
  * firing.
  */
 export async function offerClaudeHandoff(ctx: HandoffContext): Promise<boolean> {
+  const native = await offerHostMaintenance(buildHandoffPrompt(ctx), process.cwd(), true);
+  if (native !== undefined) return native;
+  const provider = getHostMaintenanceProvider();
+  if (provider !== 'claude' && !isClaudeReady()) {
+    p.log.warn(`${provider} has no available host help. See logs/setup.log or run pnpm run maintain -- --configure.`);
+    return false;
+  }
   if (!isClaudeUsable()) {
     p.log.warn(brandBody("Claude isn't installed yet — can't hand you off here. Finish setup first, then retry."));
     return false;
@@ -114,10 +121,13 @@ let handoffSessionStarted = false;
  * first user message. Resolves when Claude exits and control returns to
  * the setup driver.
  */
-function spawnInteractiveClaude(prompt: string): Promise<boolean> {
+function spawnInteractiveClaude(prompt: string, projectRoot = process.cwd()): Promise<boolean> {
   const sessionArgs = handoffSessionStarted ? ['--resume', handoffSessionId] : ['--session-id', handoffSessionId];
   return new Promise<boolean>((resolve) => {
-    const child = spawn('claude', [prompt, '--permission-mode', 'auto', ...sessionArgs], { stdio: 'inherit' });
+    const child = spawn('claude', [prompt, '--permission-mode', 'auto', ...sessionArgs], {
+      cwd: projectRoot,
+      stdio: 'inherit',
+    });
     child.on('close', () => {
       handoffSessionStarted = true;
       p.log.success(brandBody("Back from Claude. Let's continue."));
@@ -128,6 +138,12 @@ function spawnInteractiveClaude(prompt: string): Promise<boolean> {
       resolve(false);
     });
   });
+}
+
+/** Standalone operational work has no setup channel or setup step to resume. */
+export async function offerClaudeMaintenance(request: string, projectRoot = process.cwd()): Promise<boolean> {
+  if (!(await ensureClaudeReady(projectRoot))) return false;
+  return spawnInteractiveClaude(request, projectRoot);
 }
 
 /**
@@ -241,8 +257,11 @@ function buildHandoffPrompt(ctx: HandoffContext): string {
 export async function offerClaudeOnFailure(ctx: AssistContext, projectRoot: string = process.cwd()): Promise<boolean> {
   if (process.env.NANOCLAW_SKIP_CLAUDE_ASSIST === '1') return false;
 
-  const provider = getPickedProvider();
-  if (provider) {
+  const native = await offerHostMaintenance(buildFailurePrompt(ctx, projectRoot), projectRoot);
+  if (native !== undefined) return native;
+
+  const provider = getHostMaintenanceProvider(projectRoot);
+  if (provider !== 'claude') {
     const assist = getSetupProvider(provider)?.offerFailureAssist;
     if (assist) {
       const outcome = await assist(ctx, projectRoot);
@@ -297,7 +316,7 @@ async function offerFailureHandoff(ctx: AssistContext, projectRoot: string): Pro
     'Handing off to Claude',
   );
 
-  return spawnInteractiveClaude(buildFailurePrompt(ctx, projectRoot));
+  return spawnInteractiveClaude(buildFailurePrompt(ctx, projectRoot), projectRoot);
 }
 
 function buildFailurePrompt(ctx: AssistContext, projectRoot: string): string {

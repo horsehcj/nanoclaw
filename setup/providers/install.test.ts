@@ -50,6 +50,10 @@ function root(seam = 2) {
     path.join(root, 'src/provider-contracts/registry.ts'),
     `export const PROVIDER_HOST_CONTRACT_SEAM_VERSION = ${seam};\n`,
   );
+  fs.writeFileSync(
+    path.join(root, 'setup/providers/host-harness-contract.ts'),
+    'export const HOST_HARNESS_SEAM_VERSION = 1;\n',
+  );
   fs.writeFileSync(path.join(root, 'container/cli-tools.json'), '[]\n');
   fs.writeFileSync(path.join(root, 'container/agent-runner/package.json'), '{"dependencies":{}}\n');
   fs.writeFileSync(path.join(root, 'container/Dockerfile'), 'ARG BUN_VERSION=1.4.0\n');
@@ -76,6 +80,14 @@ afterEach(() => {
 });
 
 describe('OpenCode setup installation and refresh', () => {
+  it('refuses a core without the host maintenance contract before copying payload files', async () => {
+    const directory = root();
+    fs.unlinkSync(path.join(directory, 'setup/providers/host-harness-contract.ts'));
+    const before = tree(directory);
+    const result = await applyProviderSkill(skill, directory);
+    expect(result.blockers.length).toBeGreaterThan(0);
+    expect(tree(directory)).toEqual(before);
+  });
   it('uses the pinned Bun when the host has a different version', async () => {
     fixture.bunVersion = '1.3.0';
     const result = await applyProviderSkill(skill, root());

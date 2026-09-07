@@ -23,6 +23,7 @@
     "prepare": "husky",
     "setup": "tsx setup/index.ts",
     "setup:auto": "tsx setup/auto.ts",
+    "maintain": "tsx setup/maintenance.ts",
     "ncl": "tsx src/cli/client.ts",
     "migrate": "tsx scripts/migrate.ts",
     "release-notes": "node scripts/release-notes.mjs",

@@ -39,6 +39,58 @@ afterEach(() => {
 });
 
 describe('provider contract verifier', () => {
+  it('requires and runs host lifecycle tests for an installed provider declaring maintenance', async () => {
+    const root = fixture(['claude', 'opencode']);
+    const commands: string[] = [];
+    const options = {
+      commandAvailable: () => true,
+      exec: (command: string) => {
+        commands.push(command);
+        if (command.includes('provider-contract-names.ts'))
+          return JSON.stringify({
+            host: ['claude', 'opencode'],
+            hostProviders: ['opencode'],
+            setupProviders: ['claude'],
+            hostMaintenance: ['opencode'],
+          });
+        if (command.includes('src/provider-contracts/names.ts'))
+          return JSON.stringify({ contracts: ['claude', 'opencode'], providers: ['claude', 'opencode'] });
+      },
+    };
+    expect(await verifyProviderContracts(root, options)).toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('scripts/opencode-host.test.ts'),
+    });
+    fs.mkdirSync(path.join(root, 'scripts'));
+    fs.writeFileSync(path.join(root, 'scripts/opencode-host.test.ts'), '');
+    fs.writeFileSync(path.join(root, 'scripts/example$(touch injected)-host.test.ts'), '');
+    fs.writeFileSync(path.join(root, 'scripts/example with spaces-host.test.ts'), '');
+    expect((await verifyProviderContracts(root, options)).status).toBe('passed');
+    expect(
+      commands.some(
+        (command) => command.startsWith('pnpm exec vitest run ') && command.includes('scripts/opencode-host.test.ts'),
+      ),
+    ).toBe(true);
+    expect(commands.every((command) => !command.includes('$(touch') && !command.includes('with spaces'))).toBe(true);
+  });
+
+  it('allows a bundled host offer before its runtime skill has been applied', async () => {
+    const result = await verifyProviderContracts(fixture(), {
+      commandAvailable: () => true,
+      exec: (command) => {
+        if (command.includes('provider-contract-names.ts'))
+          return JSON.stringify({
+            host: ['claude'],
+            hostProviders: [],
+            setupProviders: ['claude'],
+            hostMaintenance: ['opencode'],
+          });
+        if (command.includes('src/provider-contracts/names.ts'))
+          return JSON.stringify({ contracts: ['claude'], providers: ['claude'] });
+      },
+    });
+    expect(result.status).toBe('passed');
+  });
   it('accepts only the Bun version pinned by the container image', () => {
     const root = fixture();
     expect(isPinnedBunVersion(root, '1.3.12')).toBe(true);

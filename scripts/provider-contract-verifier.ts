@@ -71,9 +71,21 @@ export async function verifyProviderContracts(
     await run('host dependencies', 'pnpm install --frozen-lockfile');
     await run('runtime dependencies', `${bun} install --frozen-lockfile`, runnerRoot);
     await run('host build', 'pnpm run build');
-    const optionalHostTests = fs.existsSync(path.join(root, 'src/opencode-cli-tools.test.ts'))
-      ? ' src/opencode-cli-tools.test.ts'
-      : '';
+    const optionalHostTests = [
+      'src/opencode-cli-tools.test.ts',
+      'setup/lib/host-maintenance.test.ts',
+      'setup/lib/host-handoff-routing.test.ts',
+      'setup/maintenance.test.ts',
+      ...(fs.existsSync(path.join(root, 'scripts'))
+        ? fs
+            .readdirSync(path.join(root, 'scripts'))
+            .filter((file) => /^[a-z0-9]+(?:-[a-z0-9]+)*-host\.test\.ts$/.test(file))
+            .map((file) => `scripts/${file}`)
+        : []),
+    ]
+      .filter((file) => fs.existsSync(path.join(root, file)))
+      .map((file) => ` ${file}`)
+      .join('');
     await run(
       'host provider contract tests',
       `pnpm exec vitest run src/provider-contracts src/providers setup/provider-contract.test.ts setup/providers${optionalHostTests}`,
@@ -87,6 +99,7 @@ export async function verifyProviderContracts(
       host: string[];
       hostProviders: string[];
       setupProviders: string[];
+      hostMaintenance?: string[];
     };
     const runtime = JSON.parse(
       await run('runtime contract inventory', `${bun} src/provider-contracts/names.ts`, runnerRoot),
@@ -110,6 +123,12 @@ export async function verifyProviderContracts(
       }
     }
     checks.push('runtime conformance test files');
+    for (const provider of host.hostMaintenance ?? []) {
+      if (!host.host.includes(provider)) continue; // bundled offer, not an installed runtime
+      const file = `scripts/${provider}-host.test.ts`;
+      if (!fs.existsSync(path.join(root, file)))
+        throw new Error(`Provider '${provider}' declares host maintenance but ships no ${file}`);
+    }
     const contracts = new Set(host.host);
     const registered = new Set([...host.hostProviders, ...host.setupProviders, ...runtime.providers]);
     const undeclared = [...registered].filter((provider) => !contracts.has(provider)).sort();

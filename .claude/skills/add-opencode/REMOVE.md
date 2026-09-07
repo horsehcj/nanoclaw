@@ -40,6 +40,8 @@ rm -f container/agent-runner/src/providers/opencode.ts
 rm -f scripts/opencode-auth-config.test.ts
 rm -f scripts/opencode-auth.test.ts
 rm -f scripts/opencode-auth.ts
+rm -f scripts/opencode-host.ts
+rm -f scripts/opencode-host.test.ts
 rm -f scripts/opencode-model-config.ts
 rm -f scripts/opencode-models.test.ts
 rm -f scripts/opencode-models.ts
@@ -75,3 +77,11 @@ import remains in any of the five barrels and neither dependency manifest
 contains its OpenCode entry. An uninstalled provider fails in the runner; the
 host can first warn and compose default surfaces. Switch affected groups before
 removing the skill.
+
+Host maintenance is independent of the group runtime. To stop using OpenCode
+for maintenance, run `pnpm run maintain -- --configure` and select another
+host coding agent or disable assistance. Remove `data/host-harness/opencode/`
+only if this installation created it and the operator wants its private CLI
+removed. Preserve globally installed OpenCode, native credentials, configuration,
+and conversation history. The bundled maintenance module remains usable while
+this skill remains in the checkout, even after removing its container runtime.

@@ -199,7 +199,7 @@ async function handleStall(
         },
         {
           value: 'help',
-          label: 'Ask Claude to take a look',
+          label: 'Ask the host coding agent to take a look',
           hint: 'reads the raw build log and suggests a fix',
         },
       ],
