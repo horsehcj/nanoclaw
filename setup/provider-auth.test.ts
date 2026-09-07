@@ -12,8 +12,8 @@ const fixture = vi.hoisted(() => ({
 }));
 vi.mock('./providers/index.js', () => ({}));
 vi.mock('./providers/registry.js', () => {
-  const entry = () => ({
-    value: 'opencode',
+  const entry = (name = 'opencode') => ({
+    value: name,
     runAuth: async () => {
       fixture.order.push('auth');
       await fixture.auth();
@@ -21,11 +21,13 @@ vi.mock('./providers/registry.js', () => {
     runInstallCheck: fixture.check,
   });
   return {
-    getSetupProvider: () => (fixture.installed ? entry() : undefined),
+    getSetupProvider: (name: string) => (fixture.installed ? entry(name) : undefined),
     listSetupProviders: () => (fixture.installed ? [entry()] : []),
   };
 });
-vi.mock('./providers/opencode.js', () => {
+// Use a tracked module for this sequencing fixture so the mock resolves even
+// before optional provider payloads have been installed in a clean checkout.
+vi.mock('./providers/claude.js', () => {
   fixture.installed = true;
   fixture.order.push('load-adapter');
   return {};
@@ -84,7 +86,7 @@ afterEach(() => {
 describe('standalone provider setup flow', () => {
   it('loads the setup adapter after a fresh installation and successful image build', async () => {
     fixture.installed = false;
-    await run(['opencode']);
+    await run(['claude']);
     expect(fixture.order).toEqual(['install', 'build', 'load-adapter', 'auth']);
     expect(fixture.check).toHaveBeenCalledTimes(1);
   });
