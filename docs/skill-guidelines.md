@@ -100,6 +100,32 @@ A skill-only provider (`offered: 'false'`) must not copy a `setup/providers/<nam
 
 ---
 
+### Read-only files inside provider state
+
+Host seam version 2 accepts optional `readOnlyFileMounts` declarations. Use
+these when a session needs a host-prepared file mounted read-only inside a
+writable provider state directory, such as a non-secret credential placeholder.
+Declare the parent `volumeId` and canonical `relativePath`; the parent must be
+a writable state volume. The target cannot overlap another declared surface
+or prepared file.
+
+The provider's host adapter selects the file by returning a regular-file
+`mounts` contribution with the matching container path and `readonly: true`.
+No matching contribution means no file bind for that session. Core validates
+the source, prepares the target without following symlinks inside the state
+directory, and appends the bind after the writable parent. Other legacy mounts
+are still ignored for declared providers. The provider remains responsible
+for validating the file's content; declaring a bind does not make its content
+safe to expose to the container.
+
+A payload using this surface must declare `seamVersion: 2` explicitly, so an
+older core rejects it before spawning instead of silently dropping the file.
+Existing version 1 contracts remain supported without this field. Install and
+removal must cover the file's source and any provider-owned configuration.
+Never delete session state implicitly on provider removal.
+
+---
+
 ## Integration points
 
 The integration point is wherever the skill reaches into existing code. Make it **minimal, colocated, and self-contained**:

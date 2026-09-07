@@ -6,6 +6,7 @@ import { materializeTemplateSkills } from '../group-skills.js';
 import { log } from '../log.js';
 import { writeAtomic } from '../migrate-claude-memory-settings.js';
 import { BASE_INSTRUCTIONS_PATH, type ProjectDocSpec } from '../project-doc-compose.js';
+import type { ProviderContainerContribution, VolumeMount } from '../providers/provider-container-registry.js';
 
 import {
   describeRegisteredProviderFileTransformers,
@@ -122,11 +123,11 @@ export async function realizeProviderSpawnSurfaces(
 ): Promise<ProviderSpawnRealization> {
   const volumes = new Map(contract.stateVolumes.map((volume) => [volume.id, volume]));
   const paths = new Map<string, string>();
-  // A registered legacy adapter still contributes env exactly as before this
-  // contract existed; only its mounts are dropped, since core now realizes
-  // every declared surface. Nothing in the contract switches this on or off.
+  // The adapter still contributes environment. Ordinary legacy mounts are
+  // ignored: core owns the declared surfaces. Only explicitly declared
+  // read-only file binds may survive, after validation below.
   const overlay = await actions.legacyOverlay();
-  const contribution = overlay.env ? { env: overlay.env } : {};
+  const contribution: ProviderContainerContribution = overlay.env ? { env: overlay.env } : {};
 
   for (const volume of contract.stateVolumes) {
     const hostPath = providerStateVolumePath(volume, agentGroupId, sessionDirectory);
@@ -136,6 +137,9 @@ export async function realizeProviderSpawnSurfaces(
   for (const file of contract.files) {
     if (file.prepare.when === 'every-spawn') prepareSpawnFile(file, volumes, agentGroupId, sessionDirectory);
   }
+
+  const fileMounts = realizeReadOnlyFileMounts(contract, overlay.mounts ?? [], agentGroupId, sessionDirectory);
+  if (fileMounts.length) contribution.mounts = fileMounts;
 
   for (const backing of contract.skillBackings) {
     const backingRoot = skillBackingPath(backing.location, volumes, agentGroupId, groupDir, sessionDirectory);
@@ -155,6 +159,69 @@ export async function realizeProviderSpawnSurfaces(
   if (spec) await actions.composeProjectDocument(spec);
 
   return { skillBackingPaths: paths, contribution };
+}
+
+/** Validate the selected optional binds before returning any mount to the driver. */
+function realizeReadOnlyFileMounts(
+  contract: ProviderHostContract,
+  contributed: readonly VolumeMount[],
+  agentGroupId: string,
+  sessionDirectory: string,
+): VolumeMount[] {
+  const selected: Array<{ mount: VolumeMount; root: string; relativePath: string }> = [];
+  for (const file of contract.readOnlyFileMounts ?? []) {
+    const volume = contract.stateVolumes.find((entry) => entry.id === file.volumeId);
+    if (!volume || volume.mode !== 'rw') throw new Error(`Invalid read-only file volume '${file.volumeId}'`);
+    const root = providerStateVolumePath(volume, agentGroupId, sessionDirectory);
+    // Guard containment again at realization, even for callers bypassing registration.
+    resolveWithinRoot(root, file.relativePath);
+    const containerPath = path.posix.join(volume.containerPath, file.relativePath);
+    const matches = contributed.filter((mount) => mount.containerPath === containerPath);
+    if (matches.length === 0) continue;
+    if (matches.length !== 1) throw new Error(`Duplicate provider file mount '${containerPath}'`);
+    const mount = matches[0];
+    if (mount.readonly !== true || !path.isAbsolute(mount.hostPath) || !fs.lstatSync(mount.hostPath).isFile()) {
+      throw new Error(`Provider file mount '${containerPath}' must use a read-only regular host file`);
+    }
+    selected.push({
+      mount: { hostPath: fs.realpathSync(mount.hostPath), containerPath, readonly: true },
+      root,
+      relativePath: file.relativePath,
+    });
+  }
+  for (const { root, relativePath } of selected) prepareReadOnlyFileMountpoint(root, relativePath);
+  return selected.map(({ mount }) => mount);
+}
+
+/** The state is agent-writable; never follow a planted symlink while preparing a bind. */
+function prepareReadOnlyFileMountpoint(root: string, relativePath: string): void {
+  // The session workspace also exposes the volume directory itself. An
+  // agent can replace that entry just as it can replace a child of it.
+  if (!fs.lstatSync(root).isDirectory()) {
+    throw new Error('Provider file mountpoint root must be a directory, not a symlink');
+  }
+  const parts = relativePath.split('/');
+  let directory = root;
+  for (const part of parts.slice(0, -1)) {
+    directory = path.join(directory, part);
+    try {
+      fs.mkdirSync(directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    if (!fs.lstatSync(directory).isDirectory()) {
+      throw new Error('Provider file mountpoint parent must be a directory, not a symlink');
+    }
+  }
+  const target = path.join(directory, parts.at(-1)!);
+  try {
+    fs.closeSync(fs.openSync(target, 'wx'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    if (!fs.lstatSync(target).isFile()) {
+      throw new Error('Provider file mountpoint must be a regular file, not a symlink');
+    }
+  }
 }
 
 function initializeFile(

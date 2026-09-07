@@ -25,7 +25,9 @@ export type {
   ProviderFileTransformer,
 } from './file-transformers.js';
 
-export const PROVIDER_HOST_CONTRACT_SEAM_VERSION = 1;
+// Version 2 adds optional read-only files nested inside provider state.
+// Version 1 declarations remain valid when they do not use that surface.
+export const PROVIDER_HOST_CONTRACT_SEAM_VERSION = 2;
 
 export interface ProviderProjectDocument {
   fileName: string;
@@ -116,6 +118,17 @@ export interface ProviderInferenceDeclaration {
   speedTiers: readonly string[];
 }
 
+/**
+ * Optional read-only file bind inside a writable state volume. The host
+ * adapter supplies the source in its existing mounts contribution only when
+ * this session needs the file. Core owns the target and prepares its mountpoint.
+ * No host path or credential content belongs in the declaration.
+ */
+export interface ProviderReadOnlyFileMount {
+  volumeId: string;
+  relativePath: string;
+}
+
 export interface ProviderHostContract {
   seamVersion: number;
   /** Core-composed project document carrying the provider's standing instructions. */
@@ -124,6 +137,7 @@ export interface ProviderHostContract {
   skillBackings: readonly ProviderSkillBacking[];
   skillViews: readonly ProviderSkillView[];
   files: readonly ProviderPreparedFile[];
+  readOnlyFileMounts?: readonly ProviderReadOnlyFileMount[];
   /** Present only when the mixed-version compatibility adapter must be registered. */
   legacyHostAdapter?: 'required';
   commands?: {
@@ -186,7 +200,7 @@ export function assertProviderHostConformance(): void {
 }
 
 export function assertProviderHostContractShape(provider: string, contract: ProviderHostContract): void {
-  if (contract.seamVersion !== PROVIDER_HOST_CONTRACT_SEAM_VERSION) {
+  if (contract.seamVersion !== 1 && contract.seamVersion !== PROVIDER_HOST_CONTRACT_SEAM_VERSION) {
     throw new Error(
       `${provider}.seamVersion ${String(contract.seamVersion)} is incompatible with host seam ${PROVIDER_HOST_CONTRACT_SEAM_VERSION}; run /update-skills`,
     );
@@ -385,6 +399,40 @@ export function assertProviderHostContractShape(provider: string, contract: Prov
   }
 
   unique(destinations, `${provider} container destinations`);
+
+  if (contract.readOnlyFileMounts !== undefined) {
+    if (contract.seamVersion < 2) {
+      throw new Error(`${provider}.readOnlyFileMounts requires host seam 2; run /update-skills`);
+    }
+    assertArray(contract.readOnlyFileMounts, `${provider}.readOnlyFileMounts`);
+    const targets: string[] = [];
+    const preparedFiles = contract.files.map((file) => {
+      const volume = contract.stateVolumes.find((entry) => entry.id === file.volumeId)!;
+      return path.posix.join(volume.containerPath, file.relativePath);
+    });
+    for (const file of contract.readOnlyFileMounts) {
+      assertReference(volumeIds, file.volumeId, `${provider}.readOnlyFileMounts[].volumeId`);
+      assertRelativePath(file.relativePath, `${provider}.readOnlyFileMounts[].relativePath`);
+      const volume = contract.stateVolumes.find((entry) => entry.id === file.volumeId)!;
+      if (volume.mode !== 'rw') {
+        throw new Error(`${provider}.readOnlyFileMounts must be inside a writable state volume`);
+      }
+      const target = path.posix.join(volume.containerPath, file.relativePath);
+      // The one intentional overlap is with this file's parent state volume.
+      // A nested volume, skill view, project document or prepared file has its
+      // own owner and must not hide this bind or be hidden by it.
+      for (const existing of [
+        ...destinations.filter((entry) => entry !== volume.containerPath),
+        ...preparedFiles,
+        ...targets,
+      ]) {
+        if (target === existing || target.startsWith(`${existing}/`) || existing.startsWith(`${target}/`)) {
+          throw new Error(`${provider}.readOnlyFileMounts target '${target}' overlaps '${existing}'`);
+        }
+      }
+      targets.push(target);
+    }
+  }
 }
 
 function assertAllowed(value: unknown, allowed: readonly unknown[], field: string): void {

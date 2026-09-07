@@ -122,6 +122,40 @@ registerProviderHostContract('partial-install-provider', {
   commands: { nativeAdmin: [], nativeFiltered: [] },
 });
 
+const optionalFileContribution = vi.fn((ctx: { agentGroupId: string }) => ({
+  env: { AUTH_MODE: ctx.agentGroupId === 'with-file' ? 'oauth' : 'api-key' },
+  mounts:
+    ctx.agentGroupId === 'with-file'
+      ? [
+          {
+            hostPath: path.join(TEST_ROOT, 'readonly-stub.json'),
+            containerPath: '/optional-state/vendor/auth.json',
+            readonly: true,
+          },
+        ]
+      : [],
+}));
+registerProviderContainerConfig('optional-file-provider', optionalFileContribution);
+registerProviderHostContract('optional-file-provider', {
+  seamVersion: 2,
+  projectDocument: { fileName: 'AGENTS.md', containerPath: '/workspace/agent/AGENTS.md', mountClass: 'group-state' },
+  stateVolumes: [
+    {
+      id: 'state',
+      directory: '.optional-state',
+      containerPath: '/optional-state',
+      scope: 'session',
+      mode: 'rw',
+      mountClass: 'allowlisted-extra',
+    },
+  ],
+  skillBackings: [],
+  skillViews: [],
+  files: [],
+  readOnlyFileMounts: [{ volumeId: 'state', relativePath: 'vendor/auth.json' }],
+  legacyHostAdapter: 'required',
+});
+
 function group(id: string, folder: string): AgentGroup {
   return { id, name: folder, folder, agent_provider: null, created_at: new Date().toISOString() } as AgentGroup;
 }
@@ -473,6 +507,45 @@ describe('buildMounts agent surfaces', () => {
       '/home/node/.agents',
       '/workspace/agent/AGENTS.md',
     ]);
+  });
+});
+
+describe('read-only files through the real spawn composition', () => {
+  it.each(['with-file', 'without-file'])('selects the optional file per group: %s', async (id) => {
+    const ag = group(id, id);
+    await createAgentGroup(ag);
+    await initGroupFilesystem(ag, { provider: 'optional-file-provider' });
+    fs.writeFileSync(path.join(TEST_ROOT, 'readonly-stub.json'), '{"token":"placeholder"}');
+    const config = { ...containerConfig(), provider: 'optional-file-provider' };
+    const sess = session(`${id}-session`, ag.id);
+    const resolved = await resolveProviderContribution(sess, ag, config);
+    const mounts = await buildMounts(ag, sess, config, resolved.provider, resolved.contribution, resolved.surfaces);
+    const stateIndex = mounts.findIndex((m) => m.containerPath === '/optional-state');
+    const fileIndex = mounts.findIndex((m) => m.containerPath === '/optional-state/vendor/auth.json');
+    expect(mounts[stateIndex].readonly).toBe(false);
+    expect(new Set(mounts.map((m) => m.containerPath)).size).toBe(mounts.length);
+    if (id === 'with-file') {
+      expect(fileIndex).toBeGreaterThan(stateIndex);
+      expect(mounts[fileIndex]).toMatchObject({ readonly: true, mountClass: 'allowlisted-extra', scope: ag.id });
+    } else {
+      expect(fileIndex).toBe(-1);
+    }
+  });
+
+  it('does not bypass filtering when buildMounts realizes a raw contribution itself', async () => {
+    const ag = group('without-file', 'direct-composition');
+    await createAgentGroup(ag);
+    await initGroupFilesystem(ag, { provider: 'optional-file-provider' });
+    const mounts = await buildMounts(
+      ag,
+      session('direct-session', ag.id),
+      containerConfig(),
+      'optional-file-provider',
+      {
+        mounts: [{ hostPath: TEST_ROOT, containerPath: '/undeclared', readonly: false }],
+      },
+    );
+    expect(mounts.some((m) => m.containerPath === '/undeclared')).toBe(false);
   });
 });
 

@@ -1006,12 +1006,13 @@ export async function buildMounts(
     if (lateProjectDocumentMount) mounts.push(lateProjectDocumentMount);
   }
 
-  // Provider-contributed mounts (e.g. opencode-xdg). Vetted upstream by the
-  // in-tree provider registration, which is exactly the 'allowlisted-extra'
-  // contract — classing them group-state would deny any provider whose state
-  // root sits outside the group subtree.
-  if (!contract && providerContribution.mounts) {
-    mounts.push(...providerContribution.mounts.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
+  // With a contract, realization returns only validated optional read-only
+  // file binds. Append them after their parent volumes so the file stays RO
+  // while neighboring state remains writable. Undeclared providers retain
+  // their existing contribution behavior and admission class.
+  const contributedMounts = contract ? providerSurfaces?.contribution.mounts : providerContribution.mounts;
+  if (contributedMounts) {
+    mounts.push(...contributedMounts.map((m) => ({ ...m, mountClass: 'allowlisted-extra' as const, scope })));
   }
 
   return mounts;
