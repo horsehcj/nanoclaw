@@ -26,7 +26,10 @@ transport are separate work.
 
 Check that `src/provider-contracts/registry.ts` exports host seam version 2 before
 copying the payload. Older hosts must first receive the read-only file mount
-contract prerequisite. This check prevents a partial install.
+contract prerequisite before invoking either install or refresh. The check below
+reports a missing prerequisite during install; the skill engine does not roll
+back later copies after a failed check, and refresh skips check directives.
+Update core first, then install or refresh this payload.
 
 ```nc:run effect:check
 node -e "const s=require('fs').readFileSync('src/provider-contracts/registry.ts','utf8'); if(!/PROVIDER_HOST_CONTRACT_SEAM_VERSION = 2/.test(s)) process.exit(1)"
@@ -57,6 +60,7 @@ payload/container/agent-runner/src/providers/opencode.ts -> container/agent-runn
 payload/scripts/opencode-auth-config.test.ts -> scripts/opencode-auth-config.test.ts
 payload/scripts/opencode-auth.test.ts -> scripts/opencode-auth.test.ts
 payload/scripts/opencode-auth.ts -> scripts/opencode-auth.ts
+payload/scripts/tsconfig.opencode-auth.json -> scripts/tsconfig.opencode-auth.json
 payload/src/provider-contracts/opencode.ts -> src/provider-contracts/opencode.ts
 payload/src/providers/opencode-auth-stub.ts -> src/providers/opencode-auth-stub.ts
 payload/src/providers/opencode-registration.test.ts -> src/providers/opencode-registration.test.ts
@@ -101,6 +105,10 @@ conformance suite. All checks must pass before rebuilding the agent image.
 
 ```nc:run effect:build
 pnpm run build
+```
+
+```nc:run effect:build
+pnpm exec tsc -p scripts/tsconfig.opencode-auth.json
 ```
 
 ```nc:run effect:build
@@ -162,7 +170,7 @@ Put comments on separate lines. These settings affect only OpenCode containers.
 
 - `OPENCODE_PROVIDER`: OpenCode backend ID, such as `openai` or `openrouter`.
 - `OPENCODE_MODEL`: default full `provider/model` ID. The group's model wins.
-- `OPENCODE_SMALL_MODEL`: optional separate model for lighter work.
+- `OPENCODE_SMALL_MODEL`: optional separate model for lighter work, using the same backend prefix as `OPENCODE_PROVIDER`.
 - `OPENCODE_BASE_URL`: backend URL, or `native` to use the native endpoint.
   For an `openai` backend with a custom URL, the runtime uses Chat Completions.
   An absent setting retains the historical `ANTHROPIC_BASE_URL` fallback for

@@ -59,7 +59,7 @@ registerProviderContainerConfig('opencode', (ctx) => {
   // EnvironmentFile — so under launchd/systemd, ctx.hostEnv carries none of
   // these. Fall back to the `.env` file the way the claude provider does;
   // a real exported variable still wins over the file.
-  const dotenv = readEnvFile([...PASSTHROUGH_KEYS]);
+  const dotenv = readEnvFile([...PASSTHROUGH_KEYS, AUTH_MODE_KEY]);
   for (const key of PASSTHROUGH_KEYS) {
     const value = ctx.hostEnv[key] ?? dotenv[key];
     if (value) env[key] = value;
@@ -68,7 +68,7 @@ registerProviderContainerConfig('opencode', (ctx) => {
   const mounts = ctx.coreOwnsProviderSurfaces
     ? []
     : [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }];
-  const authMode: string | undefined = ctx.hostEnv[AUTH_MODE_KEY] ?? readEnvFile([AUTH_MODE_KEY])[AUTH_MODE_KEY];
+  const authMode: string | undefined = ctx.hostEnv[AUTH_MODE_KEY] ?? dotenv[AUTH_MODE_KEY];
   if (authMode === 'chatgpt') {
     const stubPath = path.join(DATA_DIR, 'opencode', 'openai-auth-stub.json');
     if (!fs.existsSync(stubPath)) {

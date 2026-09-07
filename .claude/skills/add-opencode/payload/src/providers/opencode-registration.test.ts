@@ -36,6 +36,17 @@ function writeStub(stub: unknown) {
   return file;
 }
 describe('OpenCode host payload', () => {
+  it('keeps the installed CLI and SDK on the same supported exact pin', () => {
+    const tools = JSON.parse(fs.readFileSync(new URL('../../container/cli-tools.json', import.meta.url), 'utf8'));
+    const runner = JSON.parse(
+      fs.readFileSync(new URL('../../container/agent-runner/package.json', import.meta.url), 'utf8'),
+    );
+    expect(tools.find((entry: { name: string }) => entry.name === 'opencode-ai')).toMatchObject({
+      version: '1.18.25',
+      onlyBuilt: true,
+    });
+    expect(runner.dependencies['@opencode-ai/sdk']).toBe('1.18.25');
+  });
   it('registers the implementation and version 2 surfaces through the actual barrels', () => {
     expect(getProviderContainerConfig('opencode')).toBeTypeOf('function');
     expect(getProviderHostContract('opencode')).toMatchObject({

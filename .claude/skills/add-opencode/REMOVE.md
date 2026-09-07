@@ -35,6 +35,7 @@ rm -f container/agent-runner/src/providers/opencode.ts
 rm -f scripts/opencode-auth-config.test.ts
 rm -f scripts/opencode-auth.test.ts
 rm -f scripts/opencode-auth.ts
+rm -f scripts/tsconfig.opencode-auth.json
 rm -f src/provider-contracts/opencode.ts
 rm -f src/providers/opencode-auth-stub.ts
 rm -f src/providers/opencode-registration.test.ts
@@ -57,5 +58,6 @@ Run the host build and runner typecheck, then `./container/build.sh build` to
 remove the baked SDK and CLI from the local image. Restart the NanoClaw host
 using the installation's normal service workflow. Verify that no OpenCode
 import remains in any of the four barrels and neither dependency manifest
-contains its OpenCode entry. Selecting an uninstalled provider should fail
-clearly; it must not silently fall back to another provider.
+contains its OpenCode entry. An uninstalled provider fails in the runner; the
+host can first warn and compose default surfaces. Switch affected groups before
+removing the skill.

@@ -5,6 +5,7 @@ import path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  checkOpenCodeInstall,
   buildOneCliManagedStub,
   buildOneCliOAuthSecret,
   buildOpenCodeLoginArgs,
@@ -280,5 +281,34 @@ describe('ChatGPT credential stub idempotency', () => {
     expect(isUsableChatGptStub('not json')).toBe(false);
     expect(isUsableChatGptStub(JSON.stringify({ openai: { type: 'api', key: 'sk-live' } }))).toBe(false);
     expect(isUsableChatGptStub(JSON.stringify({}))).toBe(false);
+  });
+});
+
+describe('OpenCode installation preflight', () => {
+  it('rejects an SDK/CLI pin mismatch before authentication can start', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-pin-check-'));
+    const cwd = vi.spyOn(process, 'cwd').mockReturnValue(root);
+    try {
+      for (const file of [
+        'src/providers/opencode.ts',
+        'container/agent-runner/src/providers/opencode.ts',
+        'container/agent-runner/src/providers/mcp-to-opencode.ts',
+      ]) {
+        fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+        fs.writeFileSync(path.join(root, file), '');
+      }
+      fs.writeFileSync(
+        path.join(root, 'container/cli-tools.json'),
+        JSON.stringify([{ name: 'opencode-ai', version: '1.18.25', onlyBuilt: true }]),
+      );
+      const manifest = path.join(root, 'container/agent-runner/package.json');
+      fs.writeFileSync(manifest, JSON.stringify({ dependencies: { '@opencode-ai/sdk': '1.4.17' } }));
+      await expect(checkOpenCodeInstall()).rejects.toThrow('SDK must be pinned');
+      fs.writeFileSync(manifest, JSON.stringify({ dependencies: { '@opencode-ai/sdk': '1.18.25' } }));
+      await expect(checkOpenCodeInstall()).resolves.toBeUndefined();
+    } finally {
+      cwd.mockRestore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });

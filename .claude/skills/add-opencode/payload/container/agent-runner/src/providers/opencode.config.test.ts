@@ -22,6 +22,15 @@ afterEach(() => {
 });
 
 describe('buildOpenCodeConfig provider transport', () => {
+  it('treats a custom provider prefix literally rather than as a regular expression', () => {
+    process.env.OPENCODE_PROVIDER = 'local[1]';
+    process.env.OPENCODE_MODEL = 'local[1]/model';
+    process.env.OPENCODE_SMALL_MODEL = 'local[1]/small';
+    const config = buildOpenCodeConfig({});
+    expect(config.provider).toMatchObject({
+      'local[1]': { models: { model: { id: 'model' }, small: { id: 'small' } } },
+    });
+  });
   it('uses ProviderOptions.model before the compatibility env fallback', () => {
     process.env.OPENCODE_PROVIDER = 'openai';
     process.env.OPENCODE_MODEL = 'openai/legacy-model';

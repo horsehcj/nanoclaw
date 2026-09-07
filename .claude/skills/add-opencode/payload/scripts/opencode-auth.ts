@@ -572,6 +572,12 @@ export async function checkOpenCodeInstall(): Promise<void> {
     onlyBuilt?: boolean;
   }>;
   const cli = tools.find((entry) => entry.name === 'opencode-ai');
+  const runner = JSON.parse(
+    fs.readFileSync(path.join(process.cwd(), 'container/agent-runner/package.json'), 'utf8'),
+  ) as { dependencies?: Record<string, string> };
+  if (runner.dependencies?.['@opencode-ai/sdk'] !== '1.18.25') {
+    throw new Error('OpenCode SDK must be pinned to 1.18.25, matching the CLI');
+  }
   if (cli?.version !== '1.18.25' || cli.onlyBuilt !== true) {
     throw new Error('OpenCode CLI must be pinned to 1.18.25 with trusted postinstall enabled');
   }

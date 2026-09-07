@@ -39,8 +39,10 @@ export function resolveOpenCodeInference(
   const endpoint = environment.OPENCODE_BASE_URL ?? environment.ANTHROPIC_BASE_URL;
   const proxyUrl = endpoint === 'native' ? undefined : endpoint;
 
-  const providerModelId = model ? model.replace(new RegExp(`^${provider}/`), '') : undefined;
-  const providerSmallModelId = smallModel ? smallModel.replace(new RegExp(`^${provider}/`), '') : undefined;
+  const stripProviderPrefix = (value: string | undefined) =>
+    value?.startsWith(`${provider}/`) ? value.slice(provider.length + 1) : value;
+  const providerModelId = stripProviderPrefix(model);
+  const providerSmallModelId = stripProviderPrefix(smallModel);
   const modelsToRegister = [providerModelId, providerSmallModelId]
     .filter(Boolean)
     .filter((mid, i, a) => a.indexOf(mid as string) === i);
