@@ -166,6 +166,32 @@ continuation. The test requires a reachable backend and the correct OneCLI
 secret grant. No provider is switched by the install steps alone. If memory
 needs to move from another provider, follow `/migrate-memory` before switching.
 
+## Recover a ChatGPT login
+
+OneCLI refreshes vaulted OAuth tokens near expiry. The container uses only the
+fixed sentinel; do not implement token refresh in the provider or copy live
+credentials into a group. A saved credential is not proof that authentication
+still works.
+
+If a request fails because the login expired or was revoked, run on the host:
+
+```bash
+pnpm exec tsx scripts/opencode-auth.ts --reauth
+# For a browser on the host instead of device pairing:
+pnpm exec tsx scripts/opencode-auth.ts --reauth --method browser
+```
+
+This pairs again and updates the existing OneCLI secret ID, preserving its agent
+permissions and all backend/model defaults. It uses NanoClaw's `ONECLI_URL` and
+`ONECLI_API_KEY` management connection. If no credential exists, it creates one;
+grant that new secret to the group as described above. Retry the failed request.
+
+An unavailable vault, duplicate name, or incompatible credential entry stops the
+operation before sign-in. Resolve the gateway/permissions or entry metadata in
+OneCLI and retry; do not delete a credential to force setup to run. Failed
+pairing leaves the old entry intact; failed saves leave defaults unchanged.
+Temporary native credentials are removed after either success or failure.
+
 ## Change or refresh the default model
 
 Run `pnpm exec tsx scripts/opencode-models.ts` to keep the current default or

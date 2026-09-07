@@ -14,7 +14,9 @@ import {
   ensureChatGptStub,
   isUsableChatGptStub,
   normalizeOptionalInput,
-  hasChatGptSecret,
+  findChatGptSecret,
+  createChatGptVault,
+  runOpenCodeAuthCli,
   runOpenCodeChatGptAuth,
 } from './opencode-auth.js';
 
@@ -157,13 +159,96 @@ describe('OpenCode setup payload', () => {
   });
 });
 
-describe('hasChatGptSecret', () => {
-  it('finds the secret in a data-wrapped list', () => {
-    expect(hasChatGptSecret(JSON.stringify({ data: [{ name: 'OpenCode ChatGPT' }] }))).toBe(true);
+const secretMetadata = {
+  id: 'secret-existing',
+  name: 'OpenCode ChatGPT',
+  type: 'openai',
+  hostPattern: 'chatgpt.com',
+  valueSource: 'inline',
+  metadata: { authMode: 'oauth' },
+  pathPattern: null,
+};
+const fakeVault = (id: string | null = 'secret-existing') => ({
+  find: vi.fn(async () => id),
+  save: vi.fn(async () => {}),
+});
+
+describe('ChatGPT vault recovery', () => {
+  it('finds a unique credential and rejects ambiguous or malformed metadata', () => {
+    expect(findChatGptSecret([secretMetadata])).toBe('secret-existing');
+    expect(findChatGptSecret([{ name: 'Anthropic' }])).toBeNull();
+    for (const value of [
+      null,
+      {},
+      [null],
+      [secretMetadata, secretMetadata],
+      [{ ...secretMetadata, id: '' }],
+      [{ ...secretMetadata, type: 'generic' }],
+      [{ ...secretMetadata, valueSource: 'onepassword' }],
+      [{ ...secretMetadata, metadata: { authMode: 'api-key' } }],
+      [{ ...secretMetadata, pathPattern: '/restricted' }],
+    ]) {
+      expect(() => findChatGptSecret(value)).toThrow();
+    }
   });
-  it('is false for other secrets or bad output', () => {
-    expect(hasChatGptSecret(JSON.stringify({ data: [{ name: 'Anthropic' }] }))).toBe(false);
-    expect(hasChatGptSecret('not json')).toBe(false);
+
+  it('updates only the existing secret value through the configured gateway', async () => {
+    const fetchImpl = vi.fn(
+      async (_url: string, init?: RequestInit) =>
+        new Response(JSON.stringify(init?.method === 'GET' ? [secretMetadata] : { success: true })),
+    );
+    const vault = createChatGptVault('https://gateway.example', 'management-fixture', fetchImpl as typeof fetch);
+    expect(await vault.find()).toBe('secret-existing');
+    await vault.save({ tokens: { refresh_token: 'refresh-fixture' } }, 'secret-existing');
+    const [url, options] = fetchImpl.mock.calls[1];
+    expect(url).toBe('https://gateway.example/v1/secrets/secret-existing');
+    expect(options).toMatchObject({
+      method: 'PATCH',
+      redirect: 'error',
+      headers: { Authorization: 'Bearer management-fixture' },
+    });
+    expect(JSON.parse(options?.body as string)).toEqual({
+      value: JSON.stringify({ tokens: { refresh_token: 'refresh-fixture' } }),
+    });
+    expect(proc.execFileSync).not.toHaveBeenCalled();
+  });
+
+  it('creates a credential only when no existing ID was found', async () => {
+    const fetchImpl = vi.fn(async () => new Response('{}'));
+    await createChatGptVault('http://localhost:10255', '', fetchImpl).save({ tokens: {} }, null);
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://localhost:10255/v1/secrets',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          name: 'OpenCode ChatGPT',
+          type: 'openai',
+          hostPattern: 'chatgpt.com',
+          value: '{"tokens":{}}',
+        }),
+      }),
+    );
+  });
+
+  it('sanitizes response, transport, and JSON errors', async () => {
+    for (const fetchImpl of [
+      vi.fn(async () => new Response('sensitive-response', { status: 403 })),
+      vi.fn(async () => {
+        throw new Error('sensitive-transport');
+      }),
+      vi.fn(async () => new Response('sensitive-json')),
+    ]) {
+      await expect(createChatGptVault('https://gateway.example', '', fetchImpl).find()).rejects.toThrow(
+        'Check gateway connectivity',
+      );
+      await expect(createChatGptVault('https://gateway.example', '', fetchImpl).find()).rejects.not.toThrow(
+        'sensitive',
+      );
+    }
+  });
+
+  it('rejects unknown command options before changing state', async () => {
+    await expect(runOpenCodeAuthCli(['--reauth', '--method', 'invalid'])).rejects.toThrow('Usage:');
   });
 });
 
@@ -186,9 +271,9 @@ describe('ChatGPT credential stub idempotency', () => {
   // already holds "OpenCode ChatGPT" and an install with no stub on disk.
   it('reproduces the loop: a vaulted secret with no stub still leaves a stub behind', async () => {
     const root = makeRoot();
-    proc.execFileSync.mockReturnValue(JSON.stringify({ data: [{ name: 'OpenCode ChatGPT' }] }));
+    const vault = fakeVault();
 
-    await runOpenCodeChatGptAuth('device', { root });
+    await runOpenCodeChatGptAuth('device', { root, vault });
 
     // Before the fix this file was never written, so `src/providers/opencode.ts`
     // threw "credential stub is missing; re-run setup" on every spawn — and
@@ -197,14 +282,14 @@ describe('ChatGPT credential stub idempotency', () => {
     expect(isUsableChatGptStub(fs.readFileSync(stubIn(root), 'utf8'))).toBe(true);
     // No container sign-in was launched: the secret was already there.
     expect(proc.spawn).not.toHaveBeenCalled();
-    expect(proc.execFileSync).toHaveBeenCalledTimes(1);
+    expect(vault.find).toHaveBeenCalledTimes(1);
   });
 
   it('writes the stub when the vault secret exists but the stub does not, without signing in', async () => {
     const root = makeRoot();
     const signIn = vi.fn(async () => {});
 
-    await runOpenCodeChatGptAuth('device', { root, secretExists: () => true, signIn });
+    await runOpenCodeChatGptAuth('device', { root, vault: fakeVault(), signIn });
 
     expect(signIn).not.toHaveBeenCalled();
     const contents = fs.readFileSync(stubIn(root), 'utf8');
@@ -215,6 +300,82 @@ describe('ChatGPT credential stub idempotency', () => {
     // exists, spawn stops throwing "credential stub is missing; re-run setup".
     expect(isUsableChatGptStub(contents)).toBe(true);
   });
+
+  it('reauthenticates into the existing ID and does not rewrite defaults', async () => {
+    const root = makeRoot();
+    const env = 'OPENCODE_MODEL=openai/example\nOPENCODE_SMALL_MODEL=openai/small\n';
+    fs.writeFileSync(path.join(root, '.env'), env);
+    const vault = fakeVault();
+    const signIn = vi.fn(async () => {});
+    await runOpenCodeChatGptAuth('device', { root, vault, signIn, reauth: true });
+    expect(signIn).toHaveBeenCalledWith('device', root, 'secret-existing', vault);
+    expect(fs.readFileSync(path.join(root, '.env'), 'utf8')).toBe(env);
+  });
+
+  it('does not sign in or overwrite the stub when the vault lookup fails', async () => {
+    const root = makeRoot();
+    ensureChatGptStub(root);
+    const before = fs.readFileSync(stubIn(root), 'utf8');
+    const vault = fakeVault();
+    vault.find.mockRejectedValue(new Error('vault unavailable'));
+    const signIn = vi.fn(async () => {});
+    await expect(runOpenCodeChatGptAuth('device', { root, vault, signIn, reauth: true })).rejects.toThrow(
+      'vault unavailable',
+    );
+    expect(signIn).not.toHaveBeenCalled();
+    expect(fs.readFileSync(stubIn(root), 'utf8')).toBe(before);
+  });
+
+  it.each(['success', 'save-failure', 'changed-id'])(
+    'removes temporary native credentials and preserves state (%s)',
+    async (outcome) => {
+      const root = makeRoot();
+      let loginDir = '';
+      const vault = fakeVault();
+      if (outcome === 'save-failure') vault.save.mockRejectedValue(new Error('save failed'));
+      if (outcome === 'changed-id')
+        vault.find.mockResolvedValueOnce('secret-existing').mockResolvedValue('secret-other');
+      proc.spawn.mockImplementation((_command: string, args: string[]) => {
+        loginDir = args[args.indexOf('-v') + 1].split(':')[0];
+        const authDir = path.join(loginDir, 'data', 'opencode');
+        fs.mkdirSync(authDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(authDir, 'auth.json'),
+          JSON.stringify({
+            openai: {
+              type: 'oauth',
+              access: 'access-fixture',
+              refresh: 'refresh-fixture',
+              accountId: 'account-fixture',
+            },
+          }),
+        );
+        const child = {
+          on: (event: string, handler: (code: number) => void) => {
+            if (event === 'close') queueMicrotask(() => handler(0));
+            return child;
+          },
+        };
+        return child;
+      });
+      const result = runOpenCodeChatGptAuth('device', { root, vault, reauth: true });
+      if (outcome === 'save-failure') await expect(result).rejects.toThrow('save failed');
+      else if (outcome === 'changed-id') await expect(result).rejects.toThrow('changed during sign-in');
+      else await result;
+      expect(loginDir).not.toBe('');
+      expect(fs.existsSync(loginDir)).toBe(false);
+      if (outcome === 'changed-id') expect(vault.save).not.toHaveBeenCalled();
+      else
+        expect(vault.save).toHaveBeenCalledWith(
+          expect.objectContaining({
+            tokens: { access_token: 'access-fixture', refresh_token: 'refresh-fixture', account_id: 'account-fixture' },
+          }),
+          'secret-existing',
+        );
+      expect(fs.existsSync(stubIn(root))).toBe(outcome === 'success');
+      expect(proc.execFileSync).not.toHaveBeenCalled();
+    },
+  );
 
   it('rewrites a legacy stub to remove account metadata and unexpected secrets', () => {
     const root = makeRoot();
@@ -247,9 +408,9 @@ describe('ChatGPT credential stub idempotency', () => {
     const root = makeRoot();
     const signIn = vi.fn(async () => {});
 
-    await runOpenCodeChatGptAuth('browser', { root, secretExists: () => false, signIn });
+    await runOpenCodeChatGptAuth('browser', { root, vault: fakeVault(null), signIn });
 
-    expect(signIn).toHaveBeenCalledWith('browser', root);
+    expect(signIn).toHaveBeenCalledWith('browser', root, null, expect.any(Object));
     expect(fs.existsSync(stubIn(root))).toBe(false);
   });
 

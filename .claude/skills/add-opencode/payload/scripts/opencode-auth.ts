@@ -12,7 +12,7 @@ import { removeEnvVar, upsertEnvVar } from '../setup/set-env.js';
 import { pathToFileURL } from 'url';
 import { buildOneCliManagedStub, isOneCliManagedStub } from '../src/providers/opencode-auth-stub.js';
 export { buildOneCliManagedStub } from '../src/providers/opencode-auth-stub.js';
-import { CONTAINER_IMAGE } from '../src/config.js';
+import { CONTAINER_IMAGE, ONECLI_URL, ONECLI_API_KEY } from '../src/config.js';
 import { CONTAINER_RUNTIME_BIN } from '../src/container-runtime.js';
 import { chooseOpenCodeModel, discoverRuntimeModels } from './opencode-model-config.js';
 
@@ -243,109 +243,153 @@ export function buildOneCliOAuthSecret(authJson: unknown, now: Date = new Date()
   };
 }
 
-export function hasChatGptSecret(listOutput: string): boolean {
-  try {
-    const payload = JSON.parse(listOutput) as unknown;
-    const rows = Array.isArray(payload) ? payload : ((payload as Record<string, unknown>).data as unknown[]);
-    if (!Array.isArray(rows)) return false;
-    return rows.some((row) => (row as Record<string, unknown>).name === 'OpenCode ChatGPT');
-  } catch {
-    return false;
+/** Reject unavailable/ambiguous metadata rather than creating duplicate credentials. */
+export function findChatGptSecret(payload: unknown): string | null {
+  if (!Array.isArray(payload) || payload.some((row) => !row || typeof row !== 'object')) {
+    throw new Error('OneCLI returned invalid secret metadata.');
   }
+  const matches = payload.filter((row) => row.name === 'OpenCode ChatGPT');
+  if (matches.length > 1)
+    throw new Error('Multiple OpenCode ChatGPT credentials exist. Resolve duplicates in OneCLI before signing in.');
+  if (!matches.length) return null;
+  const secret = matches[0];
+  if (
+    typeof secret.id !== 'string' ||
+    !secret.id.trim() ||
+    secret.type !== 'openai' ||
+    secret.hostPattern !== 'chatgpt.com' ||
+    secret.valueSource !== 'inline' ||
+    secret.metadata?.authMode !== 'oauth' ||
+    secret.pathPattern
+  ) {
+    throw new Error('The OpenCode ChatGPT vault entry has unexpected metadata. Check it in OneCLI before signing in.');
+  }
+  return secret.id;
 }
 
-function chatGptSecretExists(): boolean {
-  try {
-    const output = execFileSync('onecli', ['secrets', 'list'], {
-      encoding: 'utf8',
-      timeout: 30_000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    });
-    return hasChatGptSecret(output);
-  } catch {
-    return false;
+export interface ChatGptVault {
+  find: () => Promise<string | null>;
+  save: (secret: Record<string, unknown>, existingId: string | null) => Promise<void>;
+}
+
+/** Host-only management API; use the same gateway and key as NanoClaw's runtime. */
+export function createChatGptVault(
+  url = ONECLI_URL,
+  apiKey = ONECLI_API_KEY,
+  fetchImpl: typeof fetch = globalThis.fetch,
+): ChatGptVault {
+  if (!url) throw new Error('Configure ONECLI_URL before connecting ChatGPT.');
+  const base = new URL(url);
+  if (!['http:', 'https:'].includes(base.protocol) || base.username || base.password || base.search || base.hash) {
+    throw new Error('ONECLI_URL must be an HTTP(S) gateway URL without embedded credentials, query, or fragment.');
   }
+  const request = async (suffix: string, method: string, body?: unknown): Promise<unknown> => {
+    try {
+      const response = await fetchImpl(`${base.href.replace(/\/+$/, '')}/v1/secrets${suffix}`, {
+        method,
+        headers: {
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+        signal: AbortSignal.timeout(30_000),
+        redirect: 'error',
+      });
+      if (!response.ok) throw new Error();
+      return await response.json();
+    } catch {
+      // Neither the upstream response nor a transport error may echo credentials.
+      throw new Error(
+        'Could not access the ChatGPT credential in OneCLI. Check gateway connectivity and management permissions, then retry.',
+      );
+    }
+  };
+  return {
+    find: async () => findChatGptSecret(await request('', 'GET')),
+    save: async (secret, existingId) => {
+      const value = JSON.stringify(secret);
+      if (existingId) {
+        await request(`/${encodeURIComponent(existingId)}`, 'PATCH', { value });
+      } else {
+        await request('', 'POST', { name: 'OpenCode ChatGPT', type: 'openai', hostPattern: 'chatgpt.com', value });
+      }
+    },
+  };
 }
 
 export interface ChatGptAuthDeps {
-  /** Vault probe; injected in tests so no real `onecli` process is spawned. */
-  secretExists?: () => boolean;
-  /** Interactive sign-in; injected in tests to assert it is never reached. */
-  signIn?: (method: ChatGptLoginMethod, root: string) => Promise<void>;
-  /** Install root the stub is written under. */
+  vault?: ChatGptVault;
+  signIn?: (method: ChatGptLoginMethod, root: string, existingId: string | null, vault: ChatGptVault) => Promise<void>;
   root?: string;
+  reauth?: boolean;
 }
 
 export async function runOpenCodeChatGptAuth(method: ChatGptLoginMethod, deps: ChatGptAuthDeps = {}): Promise<void> {
   const root = deps.root ?? process.cwd();
-  const secretExists = deps.secretExists ?? chatGptSecretExists;
-  if (secretExists()) {
-    // Sign-in is skippable; the stub is not. It lives outside the vault, so a
-    // present secret says nothing about whether this machine has one.
-    const stub = ensureChatGptStub(root);
+  const vault = deps.vault ?? createChatGptVault();
+  const existingId = await vault.find();
+  if (existingId && !deps.reauth) {
+    ensureChatGptStub(root);
     p.log.info(
       brandBody(
-        stub === 'written'
-          ? 'ChatGPT is already connected (OneCLI secret exists) — skipped sign-in and rebuilt the container credential stub.'
-          : 'ChatGPT is already connected (OneCLI secret exists) — skipping sign-in.',
+        'A ChatGPT credential exists in OneCLI; sign-in skipped and container stub checked. To replace an expired or revoked login, run: pnpm exec tsx scripts/opencode-auth.ts --reauth',
       ),
     );
     return;
   }
-  await (deps.signIn ?? performChatGptSignIn)(method, root);
+  await (deps.signIn ?? performChatGptSignIn)(method, root, existingId, vault);
 }
 
-async function performChatGptSignIn(method: ChatGptLoginMethod, root: string): Promise<void> {
+async function performChatGptSignIn(
+  method: ChatGptLoginMethod,
+  root: string,
+  existingId: string | null,
+  vault: ChatGptVault,
+): Promise<void> {
   const loginDir = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode-vault-login-'));
-  const removeLoginDir = (): void => fs.rmSync(loginDir, { recursive: true, force: true });
-
-  p.log.step(brandBody(method === 'device' ? 'Starting ChatGPT device pairing…' : 'Opening ChatGPT sign-in…'));
-  const code = await runInherit(
-    CONTAINER_RUNTIME_BIN,
-    buildOpenCodeLoginArgs(loginDir, method, Boolean(process.stdin.isTTY && process.stdout.isTTY)),
-    process.env,
-  );
-  if (code !== 0) {
-    removeLoginDir();
-    throw new Error('OpenCode ChatGPT sign-in did not complete');
-  }
-
-  const authPath = path.join(loginDir, 'data', 'opencode', 'auth.json');
-  if (!fs.existsSync(authPath)) {
-    removeLoginDir();
-    throw new Error('OpenCode sign-in completed without writing auth.json');
-  }
-
-  const vaultPath = path.join(loginDir, 'onecli-openai-oauth.json');
-  const removeVaultFile = (): void => fs.rmSync(vaultPath, { force: true });
-
   try {
-    const authJson = JSON.parse(fs.readFileSync(authPath, 'utf8')) as unknown;
+    p.log.step(brandBody(method === 'device' ? 'Starting ChatGPT device pairing…' : 'Opening ChatGPT sign-in…'));
+    const code = await runInherit(
+      CONTAINER_RUNTIME_BIN,
+      buildOpenCodeLoginArgs(loginDir, method, Boolean(process.stdin.isTTY && process.stdout.isTTY)),
+      process.env,
+    );
+    if (code !== 0) throw new Error('OpenCode ChatGPT sign-in did not complete');
+    const authPath = path.join(loginDir, 'data', 'opencode', 'auth.json');
+    if (!fs.existsSync(authPath)) throw new Error('OpenCode sign-in completed without writing auth.json');
+    let authJson: unknown;
+    try {
+      authJson = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+    } catch {
+      throw new Error('OpenCode wrote an unreadable credential file. Sign in again.');
+    }
     const stub = buildOpenCodeOAuthStub(authJson);
     const secret = buildOneCliOAuthSecret(authJson);
-    fs.writeFileSync(vaultPath, `${JSON.stringify(secret, null, 2)}\n`, { mode: 0o600 });
-    fs.chmodSync(vaultPath, 0o600);
-    execFileSync(
-      'onecli',
-      [
-        'secrets',
-        'create',
-        '--name',
-        'OpenCode ChatGPT',
-        '--type',
-        'openai',
-        '--file',
-        vaultPath,
-        '--host-pattern',
-        'chatgpt.com',
-      ],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
-    );
+    if ((await vault.find()) !== existingId)
+      throw new Error('The ChatGPT vault entry changed during sign-in. Retry after checking OneCLI.');
+    await vault.save(secret, existingId);
     writeChatGptStub(stub, root);
   } finally {
-    removeVaultFile();
-    removeLoginDir();
+    fs.rmSync(loginDir, { recursive: true, force: true });
   }
+}
+
+/** Reauthentication changes the credential only, preserving backend and model defaults. */
+export async function runOpenCodeAuthCli(args: string[]): Promise<void> {
+  if (!args.length) return runOpenCodeAuthStep();
+  if (
+    args[0] !== '--reauth' ||
+    (args.length !== 1 && !(args.length === 3 && args[1] === '--method' && ['device', 'browser'].includes(args[2])))
+  ) {
+    throw new Error('Usage: opencode-auth.ts [--reauth [--method device|browser]]');
+  }
+  const method = (args[2] ?? 'device') as ChatGptLoginMethod;
+  await runOpenCodeChatGptAuth(method, { reauth: true });
+  p.log.success(
+    brandBody(
+      'ChatGPT credential saved in OneCLI. Existing agent permissions and model settings are preserved. Retry the failed request.',
+    ),
+  );
 }
 
 export async function runOpenCodeAuthStep(): Promise<void> {
@@ -524,7 +568,7 @@ export async function checkOpenCodeInstall(): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
   checkOpenCodeInstall()
-    .then(() => runOpenCodeAuthStep())
+    .then(() => runOpenCodeAuthCli(process.argv.slice(2)))
     .catch((error: unknown) => {
       console.error(error instanceof Error ? error.message : 'OpenCode authentication failed');
       process.exitCode = 1;

@@ -333,6 +333,31 @@ describe('isSessionInvalid', () => {
     expect(provider.isSessionInvalid(thrown)).toBe(false);
   });
 
+  it.each(['APIError', 'ProviderAuthError'])(
+    'an authentication failure (%s) preserves the resumable session contract',
+    async (name) => {
+      const server = fakeServer((sid) =>
+        server.push([
+          {
+            type: 'session.error',
+            properties: {
+              sessionID: sid,
+              error: { name, data: { statusCode: 401, message: 'Authentication failed' } },
+            },
+          },
+        ]),
+      );
+      installDeps([server]);
+      const provider = newProvider();
+      let thrown: unknown;
+      await runOneTurn(provider, 'ses_1').catch((error: unknown) => {
+        thrown = error;
+      });
+      expect((thrown as Error).message).toBe('Authentication failed');
+      expect(provider.isSessionInvalid(thrown)).toBe(false);
+    },
+  );
+
   it('a promptAsync NotFoundError for the resumed id is a stale session', async () => {
     const server = fakeServer(() => {});
     server.client.session.promptAsync = async () => ({
