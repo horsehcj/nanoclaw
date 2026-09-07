@@ -1,0 +1,70 @@
+{
+  "note": "Generated from the portal service implementation. Keys are throwaway test material and grant nothing.",
+  "proof": {
+    "privateKey": {
+      "kty": "EC",
+      "x": "qDaudLInD96h4ATSIbIPo0sqJG5eXnnli9RWgnh9CsE",
+      "y": "ggplQiUTouveQn9A4pgW0Ks7asBIYWs4ZRTt9FMRN9Q",
+      "crv": "P-256",
+      "d": "8Y10OYxZfHFK79x46FXICYvhJXdwqSVlI7btTUY18L0"
+    },
+    "publicKey": {
+      "kty": "EC",
+      "x": "qDaudLInD96h4ATSIbIPo0sqJG5eXnnli9RWgnh9CsE",
+      "y": "ggplQiUTouveQn9A4pgW0Ks7asBIYWs4ZRTt9FMRN9Q",
+      "crv": "P-256"
+    },
+    "cases": [
+      {
+        "method": "POST",
+        "route": "/api/v1/grants/echo/redeem",
+        "body": "{\"idempotencyKey\":\"vector-idempotency-key\"}",
+        "timestamp": "1788765379650",
+        "nonce": "Qv_i0E4-RAAMIJm4c-nX6g",
+        "proofText": "nanoclaw-perks-device-v1\nPOST\n/api/v1/grants/echo/redeem\na0c47dfc10001d88c5dbdd888a7234170e3402335cc8a9e34888496a75bbb437\n1788765379650\nQv_i0E4-RAAMIJm4c-nX6g",
+        "signature": "39noqd_TrSK2W99bnW-M0JhQ-UElcrDk9i6QF71Cy7ebncPjEJaHh0__8KsxyVwy0WZqpYMdHGv5jBKXzFWB5g"
+      },
+      {
+        "method": "GET",
+        "route": "/api/v1/device/state",
+        "body": "",
+        "timestamp": "1788765379650",
+        "nonce": "iyxnyWo5gwp2CV8JVIbkdQ",
+        "proofText": "nanoclaw-perks-device-v1\nGET\n/api/v1/device/state\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n1788765379650\niyxnyWo5gwp2CV8JVIbkdQ",
+        "signature": "eqALA27AASBDDIAOVF-mrXOmaHxeGGj2cnp09A2vHA1DQwPwgJwpn_DIEi1oMLwPSk-ATH8xzRb-Qvmow6ijMw"
+      }
+    ]
+  },
+  "envelope": {
+    "wrappingPrivateKey": {
+      "crv": "X25519",
+      "d": "gEnioXYQMXcuaOLigptr-i8DjnBOAzphw4W959ys_XU",
+      "x": "GlqhJ6FRsC6Zjkv4w-sO81agHRMdXCxPGo-9A4MYmSg",
+      "kty": "OKP"
+    },
+    "wrappingPublicKey": {
+      "crv": "X25519",
+      "x": "GlqhJ6FRsC6Zjkv4w-sO81agHRMdXCxPGo-9A4MYmSg",
+      "kty": "OKP"
+    },
+    "context": "flow-vector-1:install-vector-1",
+    "credential": {
+      "token": "vector-install-token",
+      "account_id": "acct-vector",
+      "install_id": "install-vector-1",
+      "registry": "image.example.test"
+    },
+    "envelope": {
+      "version": 1,
+      "context": "flow-vector-1:install-vector-1",
+      "publicKey": {
+        "crv": "X25519",
+        "x": "ta0Nos-5JiqSjMdXOWlWwNecm1FMvKEeMZKEJpTxN24",
+        "kty": "OKP"
+      },
+      "iv": "Rwmigv0oGUneyFgq",
+      "ciphertext": "0ZoV65VxbOcl8ZTb4vsgzUunQ-KaCBNDyK_5MLgmcnp0X5s1eVb3MBy79vqH3zPTdHJV-Iwo3iPZjOtf-_LJRoWDPqJoomAx7euoiYRkKs4umG_hz3_TZg5NBpj3qU5por7Bw_VJct1-TG-aJt_bob-rUsF2JsEHj5Xa",
+      "tag": "ilVwPhwl8U2dMzC-wQO6kg"
+    }
+  }
+}
