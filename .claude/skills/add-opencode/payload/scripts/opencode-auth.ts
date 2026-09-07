@@ -14,15 +14,14 @@ import { buildOneCliManagedStub, isOneCliManagedStub } from '../src/providers/op
 export { buildOneCliManagedStub } from '../src/providers/opencode-auth-stub.js';
 import { CONTAINER_IMAGE } from '../src/config.js';
 import { CONTAINER_RUNTIME_BIN } from '../src/container-runtime.js';
+import { chooseOpenCodeModel, discoverRuntimeModels } from './opencode-model-config.js';
 
 type Backend = 'chatgpt' | 'local' | 'openrouter' | 'deepseek' | 'custom' | 'skip';
 type ChatGptLoginMethod = 'browser' | 'device';
 
 const MAX_MODEL_DISCOVERY_BYTES = 1024 * 1024;
-const MANUAL_MODEL = '__manual_model__';
 const OPENCODE_AUTH_MODE = 'OPENCODE_AUTH_MODE';
 const OPENCODE_CHATGPT_STUB = path.join('data', 'opencode', 'openai-auth-stub.json');
-export const OPENCODE_CHATGPT_MODELS = ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6', 'gpt-5.5'] as const;
 
 function answer<T>(value: T | symbol): T {
   if (p.isCancel(value)) {
@@ -244,39 +243,6 @@ export function buildOneCliOAuthSecret(authJson: unknown, now: Date = new Date()
   };
 }
 
-export function parseChatGptModelList(output: string): string[] {
-  const ids = output
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => /^openai\/gpt-/.test(line))
-    .map((line) => line.slice('openai/'.length));
-  return [...new Set(ids)];
-}
-
-function discoverChatGptModels(): string[] {
-  // Host CLI first: it is signed in, so the openai provider is registered.
-  // The bare container has no auth, and an unauthenticated opencode reports
-  // "Provider not found: openai" — that path stays as a silenced fallback.
-  const attempts: Array<[string, string[]]> = [
-    ['opencode', ['models', 'openai']],
-    [CONTAINER_RUNTIME_BIN, ['run', '--rm', '--entrypoint', 'opencode', CONTAINER_IMAGE, 'models', 'openai']],
-  ];
-  for (const [command, args] of attempts) {
-    try {
-      const output = execFileSync(command, args, {
-        encoding: 'utf8',
-        timeout: 60_000,
-        stdio: ['ignore', 'pipe', 'ignore'],
-      });
-      const ids = parseChatGptModelList(output);
-      if (ids.length > 0) return ids;
-    } catch {
-      // try the next source
-    }
-  }
-  return [...OPENCODE_CHATGPT_MODELS];
-}
-
 export function hasChatGptSecret(listOutput: string): boolean {
   try {
     const payload = JSON.parse(listOutput) as unknown;
@@ -480,42 +446,15 @@ export async function runOpenCodeAuthStep(): Promise<void> {
   }
 
   let discoveredModels: string[] = [];
-  if (backend === 'chatgpt') {
-    discoveredModels = discoverChatGptModels();
-  } else if (backend === 'local') {
-    try {
-      discoveredModels = await discoverLocalModelIds(baseUrl);
-    } catch (error) {
-      p.log.warn(
-        brandBody(
-          `Could not list models from this endpoint (${error instanceof Error ? error.message : String(error)}). Enter the model id manually.`,
-        ),
-      );
-    }
+  try {
+    discoveredModels =
+      backend === 'local'
+        ? (await discoverLocalModelIds(baseUrl)).map((id) => `${provider}/${id}`)
+        : discoverRuntimeModels(provider, true, backend === 'chatgpt');
+  } catch {
+    p.log.warn(brandBody('Could not list models. Enter a model id manually; no built-in model list is substituted.'));
   }
-
-  let model = '';
-  if (discoveredModels.length > 0) {
-    const selected = answer(
-      await brightSelect<string>({
-        message: 'Which model should OpenCode use?',
-        options: [
-          ...discoveredModels.map((id) => ({ value: id, label: id })),
-          { value: MANUAL_MODEL, label: 'Enter a model id manually', hint: 'use a model not listed above' },
-        ],
-      }),
-    );
-    if (selected !== MANUAL_MODEL) model = `${provider}/${selected}`;
-  }
-  if (!model) {
-    model = answer(
-      await p.text({
-        message: 'Model id in provider/model form',
-        placeholder: provider === 'openai' ? 'openai/my-model' : `${provider}/model-id`,
-        validate: (value) => (String(value ?? '').includes('/') ? undefined : 'Use provider/model-id form.'),
-      }),
-    ).trim();
-  }
+  const model = await chooseOpenCodeModel(provider, discoveredModels);
 
   const key =
     backend === 'chatgpt'

@@ -9,7 +9,10 @@ const fixture = vi.hoisted(() => ({
   observedKey: '',
   writesAtVault: -1,
 }));
-vi.mock('../setup/lib/bright-select.js', () => ({ brightSelect: async () => 'openrouter' }));
+vi.mock('../setup/lib/bright-select.js', () => ({
+  brightSelect: async ({ message }: { message: string }) =>
+    message.includes('backend') ? 'openrouter' : 'openrouter/fixture',
+}));
 vi.mock('@clack/prompts', () => ({
   isCancel: (value: unknown) => typeof value === 'symbol',
   cancel: () => {
@@ -27,6 +30,7 @@ vi.mock('../setup/set-env.js', () => ({
 vi.mock('child_process', async (original) => ({
   ...(await original<typeof import('child_process')>()),
   execFileSync: (_command: string, args: string[]) => {
+    if (args.includes('models')) throw new Error('catalog unavailable');
     fixture.writesAtVault = fixture.writes.length;
     expect(args).not.toContain('fixture-key');
     expect(args).not.toContain('--value');

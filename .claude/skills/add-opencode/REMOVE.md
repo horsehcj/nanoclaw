@@ -35,6 +35,9 @@ rm -f container/agent-runner/src/providers/opencode.ts
 rm -f scripts/opencode-auth-config.test.ts
 rm -f scripts/opencode-auth.test.ts
 rm -f scripts/opencode-auth.ts
+rm -f scripts/opencode-model-config.ts
+rm -f scripts/opencode-models.ts
+rm -f scripts/opencode-models.test.ts
 rm -f scripts/tsconfig.opencode-auth.json
 rm -f src/provider-contracts/opencode.ts
 rm -f src/providers/opencode-auth-stub.ts

@@ -60,6 +60,9 @@ payload/container/agent-runner/src/providers/opencode.ts -> container/agent-runn
 payload/scripts/opencode-auth-config.test.ts -> scripts/opencode-auth-config.test.ts
 payload/scripts/opencode-auth.test.ts -> scripts/opencode-auth.test.ts
 payload/scripts/opencode-auth.ts -> scripts/opencode-auth.ts
+payload/scripts/opencode-model-config.ts -> scripts/opencode-model-config.ts
+payload/scripts/opencode-models.ts -> scripts/opencode-models.ts
+payload/scripts/opencode-models.test.ts -> scripts/opencode-models.test.ts
 payload/scripts/tsconfig.opencode-auth.json -> scripts/tsconfig.opencode-auth.json
 payload/src/provider-contracts/opencode.ts -> src/provider-contracts/opencode.ts
 payload/src/providers/opencode-auth-stub.ts -> src/providers/opencode-auth-stub.ts
@@ -116,7 +119,7 @@ cd container/agent-runner && bun run typecheck
 ```
 
 ```nc:run effect:test
-pnpm exec vitest run src/providers/opencode-registration.test.ts scripts/opencode-auth*.test.ts
+pnpm exec vitest run src/providers/opencode-registration.test.ts scripts/opencode-auth*.test.ts scripts/opencode-models.test.ts
 ```
 
 ```nc:run effect:test
@@ -162,6 +165,36 @@ Send a message and verify a reply, then send a second message to check session
 continuation. The test requires a reachable backend and the correct OneCLI
 secret grant. No provider is switched by the install steps alone. If memory
 needs to move from another provider, follow `/migrate-memory` before switching.
+
+## Change or refresh the default model
+
+Run `pnpm exec tsx scripts/opencode-models.ts` to keep the current default or
+choose another model without signing in again. This changes only
+`OPENCODE_MODEL`; the small model, endpoint, credentials, and group overrides
+stay as configured. Restart the NanoClaw host and affected groups afterward.
+
+```bash
+pnpm exec tsx scripts/opencode-models.ts --list --refresh
+pnpm exec tsx scripts/opencode-models.ts --model openai/<model-id>
+```
+
+Discovery runs the installed container's `opencode models` command and filters
+for text and tool support, including its ChatGPT-specific filter when selected.
+Only a disposable fixed sentinel is used for that filter; no credentials or host
+OpenCode files are mounted for discovery. `--refresh` fetches the runtime's
+current model catalog; it does not upgrade the CLI or SDK. Account access is checked by a real
+request, not by catalog membership. Standalone host OpenCode is never consulted.
+If discovery is unavailable, keep the existing model or enter an id manually.
+There is no static fallback list. Custom endpoint models may require manual IDs.
+The configured backend must match the model prefix; changing backends still
+uses the authentication command. Exported defaults take precedence over `.env`,
+so conflicting exported values must be cleared before changing the saved model.
+
+This separate command avoids rerunning authentication merely to change a model,
+and querying the container avoids disagreement with a separately upgraded host
+CLI. New models needing newer runtime support require a matched CLI/SDK update
+and image rebuild. Model changes do not automatically change context limits or
+modalities; adjust any custom overrides to match the new model.
 
 ## Backend defaults
 

@@ -1,5 +1,5 @@
 {
   "extends": "../tsconfig.json",
   "compilerOptions": { "rootDir": "..", "noEmit": true },
-  "include": ["opencode-auth.ts"]
+  "include": ["opencode-auth.ts", "opencode-models.ts"]
 }

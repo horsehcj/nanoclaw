@@ -14,8 +14,6 @@ import {
   ensureChatGptStub,
   isUsableChatGptStub,
   normalizeOptionalInput,
-  OPENCODE_CHATGPT_MODELS,
-  parseChatGptModelList,
   hasChatGptSecret,
   runOpenCodeChatGptAuth,
 } from './opencode-auth.js';
@@ -143,10 +141,6 @@ describe('OpenCode setup payload', () => {
     expect(args.at(-1)).toBe('ChatGPT Pro/Plus (browser)');
   });
 
-  it('offers the exact ChatGPT subscription models allowed by the pinned OpenCode plugin', () => {
-    expect(OPENCODE_CHATGPT_MODELS).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.6', 'gpt-5.5']);
-  });
-
   it('keeps the verified runtime pin and trusted postinstall together', () => {
     const root = process.cwd();
     const tools = JSON.parse(fs.readFileSync(path.join(root, 'container/cli-tools.json'), 'utf8')) as Array<{
@@ -160,16 +154,6 @@ describe('OpenCode setup payload', () => {
     const cli = tools.find((entry) => entry.name === 'opencode-ai');
     expect(cli).toEqual({ name: 'opencode-ai', version: '1.18.25', onlyBuilt: true });
     expect(runner.dependencies?.['@opencode-ai/sdk']).toBe('1.18.25');
-  });
-});
-
-describe('parseChatGptModelList', () => {
-  it('extracts and de-duplicates openai gpt model ids', () => {
-    const out = 'openai/gpt-5.6-sol\nopenai/gpt-5.6-terra\nopenai/gpt-5.6-sol\nopenai/o4-mini\nnoise\n';
-    expect(parseChatGptModelList(out)).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra']);
-  });
-  it('returns empty on unrecognized output', () => {
-    expect(parseChatGptModelList('command not found')).toEqual([]);
   });
 });
 
