@@ -53,6 +53,12 @@ afterEach(() => {
     query.abort();
 
     expect(query.events[Symbol.asyncIterator]).toBeFunction();
-    expect(provider.isSessionInvalid(new Error('session not found'))).toBe(true);
+    expect(
+      provider.isSessionInvalid(
+        new Error(JSON.stringify({ name: 'NotFoundError', data: { message: 'Session not found: missing-id' } })),
+      ),
+    ).toBe(true);
+    // A backend can return a similarly worded 404 without losing the stored session.
+    expect(provider.isSessionInvalid(new Error('session not found'))).toBe(false);
   });
 });
